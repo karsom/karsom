@@ -1,8 +1,8 @@
 - 👋 Hi, I’m @karsom
 - 👀 I’m interested in coding.
-- 🌱 I’m currently learning HTML.
-- 💞️ I’m looking to collaborate on home automation projects.
-- 📫 How to reach me - email - karansomani02@gmail.com.
+- 🌱 I’m currently learning HTML and Python.
+- 💞️ Learning about AI and building random cool projects
+- 📫 How to reach me - email - karansomani02@gmail.com
 
 <!---
 karsom/karsom is a ✨ special ✨ repository because its `README.md` (this file) appears on your GitHub profile.
