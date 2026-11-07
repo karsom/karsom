@@ -29,6 +29,10 @@
   .stage.live canvas#view { position:absolute; left:0; top:0; width:100%; height:100%; }
   .row { display:flex; align-items:center; gap:10px; margin-top:12px; font:12px ui-monospace, Menlo, monospace; color:var(--dim); }
   .row input[type=range] { flex:1; accent-color:var(--cyan); }
+  .chip { display:inline-flex; width:48px; height:48px; align-items:center; justify-content:center; margin:4px; font-size:24px;
+    border-radius:12px; background:#121a25; border:1px solid var(--line); cursor:pointer; }
+  .chip.sel { border-color:var(--cyan); box-shadow:0 0 0 2px var(--cyan) inset; }
+  .rowlbl { font:11px ui-monospace,monospace; color:var(--dim); }
   .tips { font-size:13px; color:var(--dim); margin-top:14px; }
   .tips b { color:#cfe3ff; }
 </style>
@@ -44,11 +48,23 @@
     <div id="status">Tap Start live scan, then point at the puzzle.</div>
   </div>
 
+  <div id="teach" class="answer" style="display:none;margin-top:12px;text-align:left">
+    <div style="font:12px ui-monospace,monospace;color:var(--dim);margin-bottom:8px">TEACH · tap a wrong symbol to correct it, or confirm the read</div>
+    <div id="chips"></div>
+    <div id="picker" style="display:none;margin-top:10px"></div>
+    <div class="btns" style="margin:10px 0 0">
+      <button id="good">✓ Correct — learn</button>
+      <button id="forget">Reset learning</button>
+    </div>
+    <div id="learnInfo" style="font:12px ui-monospace,monospace;color:var(--dim);margin-top:8px"></div>
+  </div>
+
   <div class="btns">
     <button id="live" class="primary">● Start live scan</button>
     <label class="btn" for="snap">📷 Snap photo</label>
   </div>
   <input id="snap" type="file" accept="image/*" capture="environment">
+  <div class="btns" style="margin-top:-4px"><button id="freeze">❚❚ Freeze to teach</button><button id="unfreeze">▶ Resume</button></div>
 
   <div class="stage" id="stage">
     <video id="video" playsinline muted autoplay></video>
@@ -56,6 +72,7 @@
   </div>
 
   <div class="row">
+    <label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="dbg"> show mask</label>
     <span>Threshold</span>
     <input id="thr" type="range" min="0" max="100" value="0">
     <span id="thrv">auto</span>
@@ -64,13 +81,14 @@
   <div class="tips">
     <b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
     <b>Frame it:</b> both symbol rows in shot, phone roughly parallel to the screen, no glare across the symbols.<br>
-    <b>Green boxes</b> = symbols read. If it fails, try again with less glare, or drag Threshold off "auto".
+    <b>Wrong read?</b> Freeze → tap the wrong symbol → pick the right one. It learns on this phone and gets better each time. Unknown symbols (♥ etc.) can be taught with ＋ new shape.<br><b>Green boxes</b> = symbols read. If it fails, try again with less glare, or drag Threshold off "auto".
   </div>
 </main>
 
 <script id="core">
 // ---------- Pure detection core (no DOM) ----------
-const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●" };
+const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●", diamond:"◆" };
+const glyph = k => GLYPH[k] || k;
 
 function toGray(rgba, n) {
   const g = new Uint8Array(n);
@@ -155,15 +173,92 @@ function blobs(g, w, h, t) {
     b.solidity = b.area / hullArea(pts);
     b.extent = b.area / (b.bw * b.bh);
     b.corner = corner / cornerN;
-    b.glyph = classify(b);
+    const grid = new Float32Array(G * G), tot = new Float32Array(G * G);
+    for (let y = b.miny; y <= b.maxy; y++) for (let x = b.minx; x <= b.maxx; x++) {
+      const c = Math.min(G - 1, ((y - b.miny) * G / b.bh) | 0) * G + Math.min(G - 1, ((x - b.minx) * G / b.bw) | 0);
+      tot[c]++; if (lab[y * w + x] === b.id) grid[c]++;
+    }
+    for (let i = 0; i < G * G; i++) grid[i] = tot[i] ? grid[i] / tot[i] : 0;
+    b.grid = grid;
+    b.glyph = bestClass(grid);
   }
   return out;
 }
 
-function classify(b) {
-  if (b.solidity < 0.86) return b.legs >= 2 || b.solidity < 0.55 ? "star" : "plus";
-  if (b.extent < 0.66) return "triangle";
-  return b.corner > 0.45 ? "square" : "circle";
+// ---------- Shape model: templates + user-taught examples ----------
+const G = 16;
+function tpl(fn) {
+  const t = new Float32Array(G * G);
+  for (let gy = 0; gy < G; gy++) for (let gx = 0; gx < G; gx++) {
+    let c = 0;
+    for (let sy = 0; sy < 4; sy++) for (let sx = 0; sx < 4; sx++) if (fn((gx + (sx + .5) / 4) / G, (gy + (sy + .5) / 4) / G)) c++;
+    t[gy * G + gx] = c / 16;
+  }
+  return t;
+}
+function inPoly(x, y, P) {
+  let inside = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++)
+    if ((P[i][1] > y) !== (P[j][1] > y) && x < (P[j][0] - P[i][0]) * (y - P[i][1]) / (P[j][1] - P[i][1]) + P[i][0]) inside = !inside;
+  return inside;
+}
+function starPoly(inner) {
+  const p = [];
+  for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? inner : 1; p.push([r * Math.cos(a), r * Math.sin(a)]); }
+  const xs = p.map(q => q[0]), ys = p.map(q => q[1]), x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  return p.map(q => [(q[0] - x0) / (x1 - x0), (q[1] - y0) / (y1 - y0)]);
+}
+const BUILTIN = {
+  square: [tpl(() => true), tpl((x, y) => !(Math.hypot(Math.max(0, Math.abs(x - .5) - .3), Math.max(0, Math.abs(y - .5) - .3)) > .2))],
+  circle: [tpl((x, y) => (x - .5) ** 2 + (y - .5) ** 2 <= .25)],
+  triangle: [tpl((x, y) => inPoly(x, y, [[.5, 0], [1, 1], [0, 1]]))],
+  diamond: [tpl((x, y) => Math.abs(x - .5) + Math.abs(y - .5) <= .5)],
+  plus: [.26, .33, .40].map(a => tpl((x, y) => Math.abs(x - .5) <= a / 2 || Math.abs(y - .5) <= a / 2)),
+  star: [.36, .42, .5].map(r => { const P = starPoly(r); return tpl((x, y) => inPoly(x, y, P)); }),
+};
+let LEARNED = {};   // name -> [Float32Array grid], filled by the UI from localStorage
+function iou(a, b) { let mn = 0, mx = 0; for (let i = 0; i < a.length; i++) { mn += Math.min(a[i], b[i]); mx += Math.max(a[i], b[i]); } return mx ? mn / mx : 0; }
+function classList() { return [...new Set(Object.keys(BUILTIN).concat(Object.keys(LEARNED)))]; }
+function classScore(grid, k) {
+  let best = 0;
+  for (const t of BUILTIN[k] || []) best = Math.max(best, iou(grid, t));
+  for (const t of LEARNED[k] || []) best = Math.max(best, iou(grid, t) + 0.03);   // taught examples get a small edge
+  return best;
+}
+function bestClass(grid) { let bk = null, bs = -1; for (const k of classList()) { const v = classScore(grid, k); if (v > bs) { bs = v; bk = k; } } return bk; }
+
+function* combos(n, k, start = 0, acc = []) {
+  if (acc.length === k) { yield acc.slice(); return; }
+  for (let i = start; i < n; i++) { acc.push(i); yield* combos(n, k, i + 1, acc); acc.pop(); }
+}
+function bestPerm(S, set) {               // assign each blob in a row a distinct class from `set`
+  const n = set.length, used = new Array(n).fill(false), cur = []; let best = { s: -1 };
+  (function rec(i, sum) {
+    if (i === n) { if (sum > best.s) best = { s: sum, perm: cur.slice() }; return; }
+    for (let j = 0; j < n; j++) if (!used[j]) { used[j] = true; cur.push(set[j]); rec(i + 1, sum + S[i][set[j]]); cur.pop(); used[j] = false; }
+  })(0, 0);
+  return best;
+}
+// Joint read of two rows: both must be permutations of the same set of distinct shapes.
+function assignRows(A, B) {
+  const K = classList(), n = A.length;
+  if (n > K.length || n > 8) return null;
+  const SA = A.map(b => K.map(k => classScore(b.grid, k))), SB = B.map(b => K.map(k => classScore(b.grid, k)));
+  const opts = [];
+  for (const c of combos(K.length, n)) {
+    const pa = bestPerm(SA, c), pb = bestPerm(SB, c);
+    opts.push({ tot: pa.s + pb.s, pa: pa.perm, pb: pb.perm });
+  }
+  opts.sort((x, y) => y.tot - x.tot);
+  const best = opts[0];
+  const top = best.pa.map(i => K[i]), bottom = best.pb.map(i => K[i]);
+  const each = best.pa.map((k, i) => SA[i][k]).concat(best.pb.map((k, i) => SB[i][k]));
+  if (Math.min(...each) < 0.45) return null;                     // something doesn't look like any known shape
+  const code = bottom.map(x => top.indexOf(x) + 1).join("");
+  const rival = opts.find(o => o.pb.map(i => K[i]).map(x => o.pa.map(i => K[i]).indexOf(x) + 1).join("") !== code);
+  const margin = rival ? (best.tot - rival.tot) / (2 * n) : 1;
+  if (margin < 0.015) return null;                                 // too close to call
+  return { top, bottom, mean: best.tot / (2 * n), margin, code };
 }
 
 // Find horizontal runs of similar-sized blobs ("segments"), then a pair of
@@ -195,7 +290,7 @@ function segments(bs) {
 let lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
 function solveAt(g, w, h, t) {
   const bs = blobs(g, w, h, t), segs = segments(bs);
-  if (bs.length >= lastStats.blobs) lastStats = { blobs: bs.length, segs: segs.length, t, list: bs };
+  if (bs.length >= lastStats.blobs) lastStats = { blobs: bs.length, segs: segs.length, t, list: bs, mask: g };
   const mean = (seg, k) => seg.reduce((s, b) => s + b[k], 0) / seg.length;
   let best = null;
   for (const A of segs) for (const B of segs) {
@@ -204,25 +299,80 @@ function solveAt(g, w, h, t) {
     if (dy < 1.2 * sz || dy > 6 * sz) continue;                     // B is the row below A
     const r = mean(A, "size") / mean(B, "size"); if (r < 0.65 || r > 1.55) continue;
     if (Math.abs(mean(A, "cx") - mean(B, "cx")) > 2 * sz) continue; // stacked, not side by side
-    const T = A.map(b => b.glyph), Bo = B.map(b => b.glyph);
-    if (new Set(T).size !== T.length || new Set(Bo).size !== Bo.length || !Bo.every(x => T.includes(x))) continue;
-    const score = A.length * 1000 + sz - dy / sz;
-    if (!best || score > best.score) best = {
-      score, threshold: t, top: T, bottom: Bo, blobs: A.concat(B),
-      code: Bo.map(x => T.indexOf(x) + 1).join(""),
-      inverse: T.map(x => Bo.indexOf(x) + 1).join("")
-    };
+    const J = assignRows(A, B); if (!J) continue;
+    const score = A.length * 1000 + J.mean * 100 - dy / sz;
+    if (!best || score > best.score) {
+      A.forEach((b, i) => b.glyph = J.top[i]); B.forEach((b, i) => b.glyph = J.bottom[i]);
+      best = {
+        score, threshold: t, top: J.top, bottom: J.bottom, blobs: A.concat(B), rowA: A, rowB: B, conf: J.mean, margin: J.margin,
+        code: J.code, inverse: J.top.map(x => J.bottom.indexOf(x) + 1).join("")
+      };
+    }
   }
   return best;
 }
 
-function solve(rgba, w, h, manualT) {
+// ---- Binarisation methods: both polarities (dark & light mode), global + local ----
+function integral(g, w, h) {
+  const I = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; }
+  }
+  return I;
+}
+function maskGlobal(g, t, pol) {
+  const m = new Uint8Array(g.length);
+  if (pol > 0) for (let i = 0; i < g.length; i++) m[i] = g[i] > t ? 255 : 0;
+  else for (let i = 0; i < g.length; i++) m[i] = g[i] < t ? 255 : 0;
+  return m;
+}
+function maskLocal(g, w, h, I, r, c, pol) {
+  const m = new Uint8Array(g.length), W = w + 1;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      const mean = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((y1 - y0) * (x1 - x0));
+      const v = g[y * w + x];
+      m[y * w + x] = (pol > 0 ? v > mean + c : v < mean - c) ? 255 : 0;
+    }
+  }
+  return m;
+}
+function methods(w) {
+  const L = [];
+  for (const pol of [1, -1]) {
+    L.push({ k: "otsu", pol });
+    L.push({ k: "local", pol, r: Math.round(w / 20), c: 14 });
+    L.push({ k: "local", pol, r: Math.round(w / 10), c: 14 });
+    L.push({ k: "local", pol, r: Math.round(w / 20), c: 28 });
+  }
+  for (const t of [150, 185, 215, 240, 120, 90]) L.push({ k: "glob", pol: 1, t });
+  for (const t of [100, 70, 130, 40, 160]) L.push({ k: "glob", pol: -1, t });
+  return L;
+}
+function runMethod(g, w, h, M, cache) {
+  let m;
+  if (M.k === "glob") m = maskGlobal(g, M.t, M.pol);
+  else if (M.k === "otsu") { cache.o ??= otsu(g); m = maskGlobal(g, cache.o, M.pol); }
+  else { cache.I ??= integral(g, w, h); m = maskLocal(g, w, h, cache.I, M.r, M.c, M.pol); }
+  const r = solveAt(m, w, h, 127);
+  if (r) r.method = M.k + (M.pol > 0 ? "+" : "−") + (M.t ?? M.r ?? "");
+  return r;
+}
+
+// order: indices of methods to try (all if omitted). Returns result with .mi = method index.
+function solve(rgba, w, h, manualT, order) {
   const g = toGray(rgba, w * h);
   lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
-  if (manualT != null) return solveAt(g, w, h, manualT);
-  const o = otsu(g);
-  const tries = [o, 150, 180, 120, 205, 100, o + 30, o - 30];
-  for (const t of tries) { if (t < 20 || t > 240) continue; const r = solveAt(g, w, h, t); if (r) return r; }
+  if (manualT != null) {
+    for (const pol of [1, -1]) { const r = solveAt(maskGlobal(g, manualT, pol), w, h, 127); if (r) return Object.assign(r, { method: "manual", mi: -1 }); }
+    return null;
+  }
+  const L = methods(w), cache = {};
+  const idx = order || L.map((_, i) => i);
+  for (const i of idx) { const r = runMethod(g, w, h, L[i], cache); if (r) return Object.assign(r, { mi: i }); }
   return null;
 }
 </script>
@@ -231,8 +381,9 @@ function solve(rgba, w, h, manualT) {
 // ---------- UI ----------
 const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
+const WORK_LIVE = 900;
 const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
-let manualT = null, lastCode = null, liveOn = false, streak = 0, pending = null;
+let manualT = null, preferred = 0, rot = 0, lastCode = null, liveOn = false, streak = 0, pending = null;
 
 $("thr").addEventListener("input", e => {
   const v = +e.target.value;
@@ -245,26 +396,82 @@ function show(r) {
   code.textContent = r.code; code.classList.add("ok");
   if (r.code !== lastCode) { code.classList.add("flash"); setTimeout(() => code.classList.remove("flash"), 180); }
   lastCode = r.code;
-  $("rows").textContent = r.top.map(x => GLYPH[x]).join(" ") + "  →  " + r.bottom.map(x => GLYPH[x]).join(" ");
+  $("rows").textContent = r.top.map(glyph).join(" ") + "  →  " + r.bottom.map(glyph).join(" ");
   $("inv").textContent = "Not an option? Try " + r.inverse;
 }
 
 // Run detection on a video frame or image; draw boxes on the view canvas.
-function analyze(src, sw, sh, ww, drawImage) {
+function analyze(src, sw, sh, ww, drawImage, order) {
   const w = ww, h = Math.round(sh * ww / sw);
   if (work.width !== w || work.height !== h) { work.width = w; work.height = h; }
   wctx.drawImage(src, 0, 0, w, h);
-  const r = solve(wctx.getImageData(0, 0, w, h).data, w, h, manualT);
+  const r = solve(wctx.getImageData(0, 0, w, h).data, w, h, manualT, order);
   if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
-  if (drawImage) vctx.drawImage(work, 0, 0); else vctx.clearRect(0, 0, w, h);
+  if ($("dbg").checked && lastStats.mask) {
+    const im = vctx.createImageData(w, h), m = lastStats.mask;
+    for (let i = 0; i < m.length; i++) { const o = i * 4; im.data[o] = im.data[o + 1] = im.data[o + 2] = m[i]; im.data[o + 3] = 255; }
+    vctx.putImageData(im, 0, 0);
+  } else if (drawImage) vctx.drawImage(work, 0, 0); else vctx.clearRect(0, 0, w, h);
   vctx.lineWidth = 2; vctx.strokeStyle = "rgba(255,255,255,.45)";
   for (const b of lastStats.list) vctx.strokeRect(b.minx - 2, b.miny - 2, b.bw + 4, b.bh + 4);   // everything seen
   if (r) {
     vctx.lineWidth = 4; vctx.strokeStyle = "#39ff9c"; vctx.fillStyle = "#39ff9c"; vctx.font = "bold 18px ui-monospace, monospace";
-    for (const b of r.blobs) { vctx.strokeRect(b.minx - 4, b.miny - 4, b.bw + 8, b.bh + 8); vctx.fillText(GLYPH[b.glyph], b.minx, b.miny - 8); }
+    for (const b of r.blobs) { vctx.strokeRect(b.minx - 4, b.miny - 4, b.bw + 8, b.bh + 8); vctx.fillText(glyph(b.glyph), b.minx, b.miny - 8); }
   }
   return r;
 }
+
+// ---------- Teach mode (stored on this phone) ----------
+const LKEY = "switchLearned.v1";
+function loadLearned() {
+  try { const o = JSON.parse(localStorage.getItem(LKEY) || "{}"); LEARNED = {}; for (const k in o) LEARNED[k] = o[k].map(a => Float32Array.from(a)); } catch (e) { LEARNED = {}; }
+  const n = Object.values(LEARNED).reduce((s, a) => s + a.length, 0);
+  $("learnInfo").textContent = n ? `${n} taught examples · ${Object.keys(LEARNED).map(k => glyph(k) + "×" + LEARNED[k].length).join("  ")}` : "No taught examples yet — built-in shapes only.";
+}
+function saveLearned() {
+  try { const o = {}; for (const k in LEARNED) o[k] = LEARNED[k].map(g => Array.from(g, v => Math.round(v * 100) / 100)); localStorage.setItem(LKEY, JSON.stringify(o)); } catch (e) {}
+  loadLearned();
+}
+function learn(k, grid) { (LEARNED[k] ||= []).push(Float32Array.from(grid)); if (LEARNED[k].length > 30) LEARNED[k].shift(); }
+let held = null, frozen = false, selBlob = null;
+function renderTeach(r) {
+  held = r; $("teach").style.display = "block"; $("picker").style.display = "none";
+  const c = $("chips"); c.innerHTML = "";
+  [["TOP", r.rowA], ["BOTTOM", r.rowB]].forEach(([lbl, row]) => {
+    const d = document.createElement("div"); d.innerHTML = `<div class="rowlbl">${lbl}</div>`;
+    row.forEach(b => {
+      const ch = document.createElement("span"); ch.className = "chip"; ch.textContent = glyph(b.glyph);
+      ch.onclick = () => { document.querySelectorAll(".chip").forEach(x => x.classList.remove("sel")); ch.classList.add("sel"); selBlob = b; openPicker(); };
+      d.appendChild(ch);
+    });
+    c.appendChild(d);
+  });
+}
+function openPicker() {
+  const p = $("picker"); p.style.display = "block"; p.innerHTML = '<div class="rowlbl">This symbol is actually:</div>';
+  for (const k of classList()) {
+    const ch = document.createElement("span"); ch.className = "chip"; ch.textContent = glyph(k);
+    ch.onclick = () => { learn(k, selBlob.grid); selBlob.glyph = k; saveLearned(); recompute(); };
+    p.appendChild(ch);
+  }
+  const nw = document.createElement("span"); nw.className = "chip"; nw.style.width = "auto"; nw.style.padding = "0 12px"; nw.style.fontSize = "14px"; nw.textContent = "＋ new shape";
+  nw.onclick = () => { const name = (prompt("Name or paste the symbol (e.g. ♥ or heart):") || "").trim(); if (!name) return; learn(name, selBlob.grid); selBlob.glyph = name; saveLearned(); recompute(); };
+  p.appendChild(nw);
+}
+function recompute() {          // re-derive the code from the corrected shapes of the held read
+  const T = held.rowA.map(b => b.glyph), B = held.rowB.map(b => b.glyph);
+  renderTeach(held);
+  if (new Set(T).size === T.length && B.every(x => T.includes(x)) && new Set(B).size === B.length) {
+    show({ ...held, top: T, bottom: B, code: B.map(x => T.indexOf(x) + 1).join(""), inverse: T.map(x => B.indexOf(x) + 1).join("") });
+    $("status").textContent = "Corrected & learned ✓";
+  } else $("status").textContent = "Learned. Rows don't match yet — correct the other symbols too.";
+}
+$("good").onclick = () => { if (!held) return; held.blobs.forEach(b => learn(b.glyph, b.grid)); saveLearned(); $("status").textContent = "Learned this read ✓"; };
+$("forget").onclick = () => { LEARNED = {}; try { localStorage.removeItem(LKEY); } catch (e) {} loadLearned(); };
+$("freeze").onclick = () => { frozen = true; const v = $("video"); try { v.pause(); } catch (e) {} if (lastGood) renderTeach(lastGood); $("status").textContent = "Frozen — teach below, then Resume"; };
+$("unfreeze").onclick = () => { frozen = false; const v = $("video"); try { v.play(); } catch (e) {} };
+let lastGood = null;
+loadLearned();
 
 // Photo mode
 $("snap").addEventListener("change", e => {
@@ -275,8 +482,8 @@ $("snap").addEventListener("change", e => {
     $("stage").classList.remove("live");
     const r = analyze(img, img.naturalWidth, img.naturalHeight, 1024, true);
     URL.revokeObjectURL(url); e.target.value = "";
-    if (r) { show(r); $("status").textContent = "Photo read OK"; }
-    else $("status").textContent = `No read · ${lastStats.blobs} shapes seen · ${lastStats.segs} rows — retake with less glare`;
+    if (r) { show(r); lastGood = r; renderTeach(r); $("status").textContent = "Photo read OK · " + r.method; }
+    else $("status").textContent = `No read · ${lastStats.blobs} shapes seen · ${lastStats.segs} rows — fill more of the frame with the puzzle and hold steady`;
   };
   img.src = url;
 });
@@ -287,7 +494,7 @@ $("live").addEventListener("click", async () => {
   const v = $("video");
   try {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no camera API (open in Safari, over https)");
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     v.srcObject = stream;
     $("stage").classList.add("live");          // video must be visible on iOS or it delivers no frames
     await v.play();
@@ -298,16 +505,19 @@ $("live").addEventListener("click", async () => {
   liveOn = true; $("live").textContent = "● Live: on";
   let frames = 0, t0 = performance.now(), fps = 0;
   const tick = () => {
-    if (v.readyState >= 2 && v.videoWidth) {
+    if (!frozen && v.readyState >= 2 && v.videoWidth) {
       let r = null;
-      try { r = analyze(v, v.videoWidth, v.videoHeight, 800, false); }
+      const n = methods(WORK_LIVE).length, order = [preferred];
+      for (let k = 0; order.length < 3 && k < n; k++) { rot = (rot + 1) % n; if (rot !== preferred) order.push(rot); }
+      try { r = analyze(v, v.videoWidth, v.videoHeight, WORK_LIVE, false, order); if (r && r.mi >= 0) preferred = r.mi; }
       catch (err) { $("status").textContent = "Scan error: " + err.message; }
+      if (r) lastGood = r;
       if (r && r.code === pending) { if (++streak >= 2) show(r); }
       else { pending = r ? r.code : null; streak = r ? 1 : 0; }
       frames++;
       const now = performance.now();
       if (now - t0 > 1000) { fps = Math.round(frames * 1000 / (now - t0)); frames = 0; t0 = now; }
-      $("status").textContent = `live ${fps} fps · ${v.videoWidth}×${v.videoHeight} · ${lastStats.blobs} shapes · ${lastStats.segs} rows` + (r ? " · ✓" : "");
+      $("status").textContent = `live ${fps} fps · ${v.videoWidth}×${v.videoHeight} · ${lastStats.blobs} shapes · ${lastStats.segs} rows` + (r ? " · ✓ " + r.method : "");
     }
     setTimeout(tick, 20);
   };
