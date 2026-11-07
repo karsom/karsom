@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Switch Solver</title>
+<style>
+  :root { --bg:#07090d; --panel:#0f141c; --line:#1d2836; --cyan:#3ee6ff; --green:#39ff9c; --dim:#7b8899; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:#e8f1ff; font:15px/1.4 -apple-system, system-ui, sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:16px; }
+  h1 { font:700 18px ui-monospace, Menlo, monospace; letter-spacing:.2em; color:var(--cyan); margin:4px 0 14px; }
+  .answer { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; text-align:center; }
+  #code { font:800 72px/1 ui-monospace, Menlo, monospace; color:var(--dim); letter-spacing:.08em; transition:color .2s, transform .2s; }
+  #code.ok { color:var(--green); }
+  #code.flash { transform:scale(1.08); }
+  #rows { font-size:24px; min-height:32px; margin-top:8px; }
+  #inv { font:13px ui-monospace, Menlo, monospace; color:var(--dim); margin-top:6px; }
+  #status { font:12px ui-monospace, Menlo, monospace; color:var(--dim); margin-top:10px; min-height:16px; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:14px 0; }
+  button, label.btn { display:flex; align-items:center; justify-content:center; gap:6px; height:52px; border-radius:14px;
+    border:1px solid var(--line); background:#121a25; color:#e8f1ff; font:600 15px -apple-system, system-ui, sans-serif; cursor:pointer; }
+  button.primary, label.primary { background:var(--cyan); color:#001018; border-color:var(--cyan); }
+  input[type=file] { display:none; }
+  .stage { position:relative; border-radius:16px; overflow:hidden; border:1px solid var(--line); background:#000; }
+  video { display:none; width:100%; }
+  canvas#view { display:block; width:100%; height:auto; }
+  .row { display:flex; align-items:center; gap:10px; margin-top:12px; font:12px ui-monospace, Menlo, monospace; color:var(--dim); }
+  .row input[type=range] { flex:1; accent-color:var(--cyan); }
+  .tips { font-size:13px; color:var(--dim); margin-top:14px; }
+  .tips b { color:#cfe3ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>SWITCH SOLVER</h1>
+
+  <div class="answer">
+    <div id="code">----</div>
+    <div id="rows"></div>
+    <div id="inv">Not an option? Try ----</div>
+    <div id="status">Tap Start live scan, then point at the puzzle.</div>
+  </div>
+
+  <div class="btns">
+    <button id="live" class="primary">● Start live scan</button>
+    <label class="btn" for="snap">📷 Snap photo</label>
+  </div>
+  <input id="snap" type="file" accept="image/*" capture="environment">
+
+  <div class="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="view" width="640" height="360"></canvas>
+  </div>
+
+  <div class="row">
+    <span>Threshold</span>
+    <input id="thr" type="range" min="0" max="100" value="0">
+    <span id="thrv">auto</span>
+  </div>
+
+  <div class="tips">
+    <b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
+    <b>Frame it:</b> both symbol rows in shot, phone roughly parallel to the screen, no glare across the symbols.<br>
+    <b>Green boxes</b> = symbols read. If it fails, try again with less glare, or drag Threshold off "auto".
+  </div>
+</main>
+
+<script id="core">
+// ---------- Pure detection core (no DOM) ----------
+const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●" };
+
+function toGray(rgba, n) {
+  const g = new Uint8Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (rgba[j] * 77 + rgba[j + 1] * 150 + rgba[j + 2] * 29) >> 8;
+  return g;
+}
+
+function otsu(g) {
+  const hist = new Float64Array(256);
+  for (let i = 0; i < g.length; i++) hist[g[i]]++;
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let wB = 0, sumB = 0, best = 0, t = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = g.length - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) ** 2;
+    if (v > best) { best = v; t = i; }
+  }
+  return t;
+}
+
+function hullArea(pts) {
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  const h = lo.slice(0, -1).concat(up.slice(0, -1));
+  let s = 0; for (let i = 0; i < h.length; i++) { const a = h[i], b = h[(i + 1) % h.length]; s += a[0] * b[1] - b[0] * a[1]; }
+  return Math.abs(s) / 2;
+}
+
+// Label white blobs and describe the symbol-like ones
+function blobs(g, w, h, t) {
+  const lab = new Int32Array(w * h), stack = new Int32Array(w * h);
+  const out = []; let id = 0;
+  for (let s = 0; s < w * h; s++) {
+    if (g[s] <= t || lab[s]) continue;
+    id++; let sp = 0; stack[sp++] = s; lab[s] = id;
+    let area = 0, minx = w, maxx = 0, miny = h, maxy = 0, sx = 0, sy = 0;
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0;
+      area++; sx += x; sy += y;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && g[p - 1] > t && !lab[p - 1]) { lab[p - 1] = id; stack[sp++] = p - 1; }
+      if (x < w - 1 && g[p + 1] > t && !lab[p + 1]) { lab[p + 1] = id; stack[sp++] = p + 1; }
+      if (y > 0 && g[p - w] > t && !lab[p - w]) { lab[p - w] = id; stack[sp++] = p - w; }
+      if (y < h - 1 && g[p + w] > t && !lab[p + w]) { lab[p + w] = id; stack[sp++] = p + w; }
+    }
+    const bw = maxx - minx + 1, bh = maxy - miny + 1;
+    if (area < 40 || bw < 8 || bh < 8) continue;
+    if (minx === 0 || miny === 0 || maxx === w - 1 || maxy === h - 1) continue;
+    const ar = bw / bh; if (ar < 0.7 || ar > 1.45) continue;
+    const cx = Math.round(sx / area), cy = Math.round(sy / area);
+    if (lab[cy * w + cx] !== id) continue;           // hollow (tile outline / ring) -> reject
+    out.push({ id, area, minx, maxx, miny, maxy, bw, bh, cx: sx / area, cy: sy / area, size: Math.max(bw, bh) });
+  }
+  // Shape features for survivors
+  for (const b of out) {
+    const pts = [];
+    let corner = 0, cornerN = 0;
+    const kx = Math.max(1, Math.round(b.bw * 0.2)), ky = Math.max(1, Math.round(b.bh * 0.2));
+    for (let y = b.miny; y <= b.maxy; y++) {
+      let lx = -1, rx = -1;
+      for (let x = b.minx; x <= b.maxx; x++) {
+        const on = lab[y * w + x] === b.id;
+        if (on) { if (lx < 0) lx = x; rx = x; }
+        const inCx = x < b.minx + kx || x > b.maxx - kx, inCy = y < b.miny + ky || y > b.maxy - ky;
+        if (inCx && inCy) { cornerN++; if (on) corner++; }
+      }
+      if (lx >= 0) pts.push([lx, y], [rx + 1, y], [lx, y + 1], [rx + 1, y + 1]);
+    }
+    // star: two separate legs near the bottom; plus: one solid stem
+    let legs = 0;
+    for (const f of [0.84, 0.88, 0.92]) {
+      const y = Math.round(b.miny + f * (b.bh - 1)); let runs = 0, prev = false;
+      for (let x = b.minx; x <= b.maxx; x++) { const on = lab[y * w + x] === b.id; if (on && !prev) runs++; prev = on; }
+      if (runs >= 2) legs++;
+    }
+    b.legs = legs;
+    b.solidity = b.area / hullArea(pts);
+    b.extent = b.area / (b.bw * b.bh);
+    b.corner = corner / cornerN;
+    b.glyph = classify(b);
+  }
+  return out;
+}
+
+function classify(b) {
+  if (b.solidity < 0.86) return b.legs >= 2 || b.solidity < 0.55 ? "star" : "plus";
+  if (b.extent < 0.66) return "triangle";
+  return b.corner > 0.45 ? "square" : "circle";
+}
+
+// Find horizontal runs of similar-sized blobs ("segments"), then a pair of
+// segments one above the other that hold the same distinct symbols.
+function segments(bs) {
+  const segs = [], used = new Set();
+  const sorted = [...bs].sort((a, b) => a.cx - b.cx);
+  for (const start of sorted) {
+    if (used.has(start)) continue;
+    const seg = [start]; let cur = start;
+    while (true) {
+      let next = null;
+      for (const b of sorted) {
+        if (b.cx <= cur.cx || seg.includes(b)) continue;
+        const r = b.size / cur.size, dx = b.cx - cur.cx;
+        if (r < 0.65 || r > 1.55) continue;
+        if (Math.abs(b.cy - cur.cy) > 0.45 * cur.size) continue;
+        if (dx < 1.1 * cur.size || dx > 4.5 * cur.size) continue;
+        if (!next || b.cx < next.cx) next = b;
+      }
+      if (!next) break;
+      seg.push(next); cur = next;
+    }
+    if (seg.length >= 3 && seg.length <= 8) { seg.forEach(b => used.add(b)); segs.push(seg); }
+  }
+  return segs;
+}
+
+function solveAt(g, w, h, t) {
+  const segs = segments(blobs(g, w, h, t));
+  const mean = (seg, k) => seg.reduce((s, b) => s + b[k], 0) / seg.length;
+  let best = null;
+  for (const A of segs) for (const B of segs) {
+    if (A === B || A.length !== B.length) continue;
+    const sz = (mean(A, "size") + mean(B, "size")) / 2, dy = mean(B, "cy") - mean(A, "cy");
+    if (dy < 1.2 * sz || dy > 6 * sz) continue;                     // B is the row below A
+    const r = mean(A, "size") / mean(B, "size"); if (r < 0.65 || r > 1.55) continue;
+    if (Math.abs(mean(A, "cx") - mean(B, "cx")) > 2 * sz) continue; // stacked, not side by side
+    const T = A.map(b => b.glyph), Bo = B.map(b => b.glyph);
+    if (new Set(T).size !== T.length || new Set(Bo).size !== Bo.length || !Bo.every(x => T.includes(x))) continue;
+    const score = A.length * 1000 + sz - dy / sz;
+    if (!best || score > best.score) best = {
+      score, threshold: t, top: T, bottom: Bo, blobs: A.concat(B),
+      code: Bo.map(x => T.indexOf(x) + 1).join(""),
+      inverse: T.map(x => Bo.indexOf(x) + 1).join("")
+    };
+  }
+  return best;
+}
+
+function solve(rgba, w, h, manualT) {
+  const g = toGray(rgba, w * h);
+  if (manualT != null) return solveAt(g, w, h, manualT);
+  const o = otsu(g);
+  const tries = [o, 150, 180, 120, 205, 100, o + 30, o - 30];
+  for (const t of tries) { if (t < 20 || t > 240) continue; const r = solveAt(g, w, h, t); if (r) return r; }
+  return null;
+}
+</script>
+
+<script>
+// ---------- UI ----------
+const $ = id => document.getElementById(id);
+const view = $("view"), vctx = view.getContext("2d", { willReadFrequently: true });
+const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
+const WORK_W = 1024;
+let manualT = null, lastCode = null, liveOn = false, streak = 0, pending = null;
+
+$("thr").addEventListener("input", e => {
+  const v = +e.target.value;
+  manualT = v === 0 ? null : Math.round(40 + v * 2);
+  $("thrv").textContent = manualT == null ? "auto" : manualT;
+});
+
+function show(r, msg) {
+  const code = $("code");
+  if (!r) { $("status").textContent = msg || "Couldn't read both rows — retake with less glare."; return; }
+  code.textContent = r.code; code.classList.add("ok");
+  if (r.code !== lastCode) { code.classList.add("flash"); setTimeout(() => code.classList.remove("flash"), 180); }
+  lastCode = r.code;
+  $("rows").textContent = r.top.map(x => GLYPH[x]).join(" ") + "  →  " + r.bottom.map(x => GLYPH[x]).join(" ");
+  $("inv").textContent = "Not an option? Try " + r.inverse;
+  $("status").textContent = "Read OK · threshold " + r.threshold;
+}
+
+function analyzeSource(src, sw, sh, ww = WORK_W) {
+  const scale = ww / sw, w = ww, h = Math.round(sh * scale);
+  work.width = w; work.height = h;
+  wctx.drawImage(src, 0, 0, w, h);
+  const img = wctx.getImageData(0, 0, w, h);
+  const r = solve(img.data, w, h, manualT);
+  // Draw preview with detections
+  view.width = w; view.height = h;
+  vctx.drawImage(work, 0, 0);
+  if (r) {
+    vctx.lineWidth = 3; vctx.strokeStyle = "#39ff9c"; vctx.fillStyle = "#39ff9c"; vctx.font = "bold 16px ui-monospace, monospace";
+    for (const b of r.blobs) { vctx.strokeRect(b.minx - 3, b.miny - 3, b.bw + 6, b.bh + 6); vctx.fillText(GLYPH[b.glyph], b.minx, b.miny - 6); }
+  }
+  return r;
+}
+
+// Photo mode (works everywhere, including inside the Claude app)
+$("snap").addEventListener("change", e => {
+  const f = e.target.files && e.target.files[0]; if (!f) return;
+  $("status").textContent = "Reading…";
+  const img = new Image(), url = URL.createObjectURL(f);
+  img.onload = () => {
+    const r = analyzeSource(img, img.naturalWidth, img.naturalHeight);
+    URL.revokeObjectURL(url); e.target.value = "";
+    show(r);
+  };
+  img.src = url;
+});
+
+// Live mode (only where the browser allows camera access, e.g. when hosted on your own HTTPS page)
+$("live").addEventListener("click", async () => {
+  if (liveOn) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 } }, audio: false });
+    const v = $("video"); v.srcObject = stream; await v.play();
+    liveOn = true; $("live").textContent = "● Live: on"; $("status").textContent = "Point at the puzzle…";
+    const tick = () => {
+      if (v.videoWidth) {
+        const r = analyzeSource(v, v.videoWidth, v.videoHeight, 800);
+        // need 2 identical frames in a row before switching answer
+        if (r && r.code === pending) { if (++streak >= 2) show(r); } else { pending = r ? r.code : null; streak = r ? 1 : 0; }
+      }
+      setTimeout(tick, 30);
+    };
+    tick();
+  } catch (err) {
+    $("status").textContent = "Live camera is blocked here — use Snap photo (live needs this page hosted on your own HTTPS site).";
+  }
+});
+</script>
+</body>
+</html>
