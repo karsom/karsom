@@ -13,6 +13,8 @@
   .answer { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:18px; text-align:center; }
   #code { font:800 72px/1 ui-monospace, Menlo, monospace; color:var(--dim); letter-spacing:.08em; transition:color .2s, transform .2s; }
   #code.ok { color:var(--green); }
+  #code.stale { color:#3d5a4a; }
+  #rows small { font:12px ui-monospace, Menlo, monospace; color:var(--cyan); }
   #code.flash { transform:scale(1.08); }
   #rows { font-size:24px; min-height:32px; margin-top:8px; }
   #inv { font:13px ui-monospace, Menlo, monospace; color:var(--dim); margin-top:6px; }
@@ -48,6 +50,13 @@
     <div id="status">Tap Start live scan, then point at the puzzle.</div>
   </div>
 
+  <div id="keypad" class="answer" style="display:none;margin-top:12px">
+    <div style="font:12px ui-monospace,monospace;color:var(--dim)">TWO-OPERATOR LEVEL · chip too blurry to read<br>Tap the digits on the chip you can see:</div>
+    <div class="btns" style="grid-template-columns:1fr 1fr;margin:10px 0 6px"><button id="kpFirst">Top chip</button><button id="kpSecond">Bottom chip</button></div>
+    <div id="kpShow" style="font:700 30px ui-monospace,monospace;letter-spacing:.2em;margin:6px 0">____</div>
+    <div id="kpKeys" class="btns" style="grid-template-columns:repeat(4,1fr);margin:6px 0"></div>
+  </div>
+
   <div id="teach" class="answer" style="display:none;margin-top:12px;text-align:left">
     <div style="font:12px ui-monospace,monospace;color:var(--dim);margin-bottom:8px">TEACH · tap a wrong symbol to correct it, or confirm the read</div>
     <div id="chips"></div>
@@ -79,15 +88,15 @@
   </div>
 
   <div class="tips">
-    <b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
-    <b>Frame it:</b> both symbol rows in shot, phone roughly parallel to the screen, no glare across the symbols.<br>
+    <b>Works on:</b> single-operator levels and two-operator levels (hidden middle row — it reads the operator chip).<br><b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
+    <b>Frame it:</b> hold the phone 25–30 cm from the screen (closer and the camera can't focus), both symbol rows in shot, phone roughly parallel to the screen, no glare across the symbols.<br>
     <b>Wrong read?</b> Freeze → tap the wrong symbol → pick the right one. It learns on this phone and gets better each time. Unknown symbols (♥ etc.) can be taught with ＋ new shape.<br><b>Green boxes</b> = symbols read. If it fails, try again with less glare, or drag Threshold off "auto".
   </div>
 </main>
 
 <script id="core">
 // ---------- Pure detection core (no DOM) ----------
-const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●", diamond:"◆" };
+const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●", diamond:"◆", hexagon:"⬢", pentagon:"⬟" };
 const glyph = k => GLYPH[k] || k;
 
 function toGray(rgba, n) {
@@ -213,6 +222,8 @@ const BUILTIN = {
   circle: [tpl((x, y) => (x - .5) ** 2 + (y - .5) ** 2 <= .25)],
   triangle: [tpl((x, y) => inPoly(x, y, [[.5, 0], [1, 1], [0, 1]]))],
   diamond: [tpl((x, y) => Math.abs(x - .5) + Math.abs(y - .5) <= .5)],
+  hexagon: [tpl((x, y) => inPoly(x, y, [[.5, 0], [1, .25], [1, .75], [.5, 1], [0, .75], [0, .25]])),
+            tpl((x, y) => inPoly(x, y, [[.25, 0], [.75, 0], [1, .5], [.75, 1], [.25, 1], [0, .5]]))],
   plus: [.26, .33, .40].map(a => tpl((x, y) => Math.abs(x - .5) <= a / 2 || Math.abs(y - .5) <= a / 2)),
   star: [.36, .42, .5].map(r => { const P = starPoly(r); return tpl((x, y) => inPoly(x, y, P)); }),
 };
@@ -296,7 +307,7 @@ function solveAt(g, w, h, t) {
   for (const A of segs) for (const B of segs) {
     if (A === B || A.length !== B.length) continue;
     const sz = (mean(A, "size") + mean(B, "size")) / 2, dy = mean(B, "cy") - mean(A, "cy");
-    if (dy < 1.2 * sz || dy > 6 * sz) continue;                     // B is the row below A
+    if (dy < 1.2 * sz || dy > 13 * sz) continue;                     // B is the row below A
     const r = mean(A, "size") / mean(B, "size"); if (r < 0.65 || r > 1.55) continue;
     if (Math.abs(mean(A, "cx") - mean(B, "cx")) > 2 * sz) continue; // stacked, not side by side
     const J = assignRows(A, B); if (!J) continue;
@@ -362,6 +373,231 @@ function runMethod(g, w, h, M, cache) {
   return r;
 }
 
+
+// ---------- Two-operator levels ----------
+// Convention (verified on real levels): code[i] = which input position lands at output position i.
+const applyOp = (op, row) => op.map(d => row[d - 1]);
+const derive = (from, to) => to.map(x => from.indexOf(x) + 1).join("");
+const isPerm = (str, n) => str.length === n && [...str].map(Number).sort().join("") === Array.from({ length: n }, (_, i) => i + 1).join("");
+// Band between the two symbol rows that holds the operator chips (in work-canvas pixels)
+function opBand(r, w, h) {
+  const A = r.rowA, B = r.rowB, s = A.reduce((m, b) => m + b.size, 0) / A.length;
+  const all = A.concat(B);
+  const x0 = Math.max(0, Math.min(...all.map(b => b.minx)) - s), x1 = Math.min(w, Math.max(...all.map(b => b.maxx)) + s);
+  const y0 = Math.max(...A.map(b => b.maxy)) + 0.6 * s, y1 = Math.min(...B.map(b => b.miny)) - 0.6 * s;
+  return { x: Math.round(x0), y: Math.round(y0), w: Math.round(x1 - x0), h: Math.round(y1 - y0), s };
+}
+const rowGeom = r => {
+  const avg = (L, k) => L.reduce((m, b) => m + b[k], 0) / L.length, A = r.rowA, B = r.rowB;
+  const pitch = (A[A.length - 1].cx - A[0].cx + B[B.length - 1].cx - B[0].cx) / (2 * (A.length - 1));
+  return { pitch, yA: avg(A, "cy"), yB: avg(B, "cy"), xA: avg(A, "cx"), xB: avg(B, "cx") };
+};
+// single-operator levels: rows ~1.4 tile-pitches apart; two-operator (hidden middle row): ~2.8
+const isTwoStep = r => { const g = rowGeom(r); return (g.yB - g.yA) / g.pitch > 2.1; };
+// words: [{text, y}] with y relative to band. Returns {first, second} operator strings (or null)
+function parseOps(words, bandH, n) {
+  const out = { first: null, second: null };
+  for (const wd of words) {
+    const d = (wd.text.match(/\d+/g) || []).join("");
+    let op = null;
+    if (isPerm(d, n)) op = d;
+    else if (d.length === n + 1 && isPerm(d.slice(1), n)) op = d.slice(1);   // arrow read as a digit
+    if (!op) continue;
+    if (wd.y < bandH / 2) out.first ??= op; else out.second ??= op;
+  }
+  return out;
+}
+function solveTwoStep(top, bottom, ops) {
+  if (ops.first && !ops.second) return { code: derive(applyOp(ops.first.split("").map(Number), top), bottom), hidden: "second" };
+  if (ops.second && !ops.first) {
+    const op = ops.second.split("").map(Number), mid = [];
+    op.forEach((d, i) => mid[d - 1] = bottom[i]);
+    return { code: derive(top, mid), hidden: "first" };
+  }
+  return null;
+}
+
+
+// ---------- Operator-chip OCR (digits) ----------
+function bandGray(rgba, W, b, K) {
+  const w = Math.round(b.w * K), h = Math.round(b.h * K), g = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = ((b.y + ((y / K) | 0)) * W + b.x + ((x / K) | 0)) * 4;
+    g[y * w + x] = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+  }
+  return { g, w, h };
+}
+// Make text black on white whatever its colour: pixels that differ strongly from their surroundings become ink
+function binarizeText(g, w, h, R, C) {
+  const I = integral(g, w, h), out = new Uint8Array(w * h), W1 = w + 1;
+  let brightInk = 0, darkInk = 0;
+  const mean = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1), y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+    const m = (I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]) / ((x1 - x0) * (y1 - y0));
+    mean[y * w + x] = m; const v = g[y * w + x];
+    if (v > m + C) brightInk++; else if (v < m - C) darkInk++;
+  }
+  const bright = brightInk >= darkInk;     // light text (dark mode) or dark text (light mode)
+  for (let i = 0; i < w * h; i++) out[i] = (bright ? g[i] > mean[i] + C : g[i] < mean[i] - C) ? 0 : 255;
+  return out;
+}
+// The two operator chips sit 1/4 and 3/4 of the way from the top row to the bottom row.
+function chipRects(r, W, H) {
+  const { pitch, yA, yB, xA, xB } = rowGeom(r), s = 0.36 * pitch;   // s ~ symbol size
+  return [0.25, 0.75].map(t => {
+    const cy = yA + t * (yB - yA), cx = xA + t * (xB - xA);
+    const x0 = Math.max(0, cx - 1.9 * s), x1 = Math.min(W, cx + 2.8 * s), y0 = Math.max(0, cy - 0.8 * s), y1 = Math.min(H, cy + 0.8 * s);
+    return { x: Math.round(x0), y: Math.round(y0), w: Math.max(1, Math.round(x1 - x0)), h: Math.max(1, Math.round(y1 - y0)), s };
+  });
+}
+// Digit templates rendered from 7 common bold UI fonts (16x16, bbox-normalised)
+const DIGIT_SRC = {"0":["00017bdffdb61000004effffffffe40004ffffd99dffff400dfffa0000afffd06fffd100001efff5afff70000009fffadfff40000006fffcefff20000005fffeefff20000005fffedfff40000006fffcafff80000009fffa5fffe100001efff50dfffb1001bfffd003ffffebbeffff30004dffffffffd40000005adffda50000","00016bdffeb71000004effffffffe50004ffff9558efff501effe300002efff27fff70000006fff8bfff20000001fffcdffe00000000cffffffc00000000bffffffc00000000bfffdffe00000000cfffbfff20000001fffc6fff80000006fff81effe400003effe204ffffa669ffff50004dffffffffe50000005adffdb60000","00017bdffeb71000003dffffffffe40003efffffefffff400dfffe5004efffe15ffff600004ffff6afffe000000dfffbcfffb000000afffeefffa0000009ffffefffa0000009ffffcfffb000000afffe9fffe100000dfffb5ffff600005ffff60cffff7226efffd102efffffffffff40003cffffffffd40000005adffeb60000","00017beffeb71000005effffffffe40005fffffccfffff401efffe2003efffd07ffff600008ffff6cffff200004ffffaeffff000002ffffdffffe000001ffffeffffe000001ffffeeffff000002ffffdcffff200004ffffa7ffff600007ffff61efffd1002efffd005ffffeaaeffff40005effffffffe40000017beffeb71000","00049ceffec8300000affffffffff9000affffa66bffff803ffff70000affff29fffe100003ffff7dfffb000000efffbffff9000000cfffdffff8000000bfffeffff8000000bfffeffff9000000cfffddfffb000000efffb9ffff100003ffff73ffff90000bfffe209ffffc99dffff70009ffffffffff80000028ceffeb71000","00017beffeb71000006effffffffe60006ffffffffffff602effffb88bffffe27ffff800008ffff7bffff200002ffffbefffe000000efffeffffc000000dffffffffc000000dffffefffd000000efffebffff100001ffffb7ffff800008ffff72effffb88bffffe206ffffffffffff60006effffffffe60000027beffeb71000","00038ceffeb7200001affffffffff9000bffffa77bffff904ffff700009ffff2afffe000002ffff8dfffa000000dfffbffff8000000cfffdffff8000000bfffeffff8000000bfffeffff9000000cfffddfffb000000dfffbafffe100002ffff74ffff80000affff20bffffc9adffff8001affffffffff80000038ceffeb71000"],"1":["0000038dfffffffd0159dffffffffffdafffffffeffffffdeffffb627ffffffdefb620007ffffffd510000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd","0000015bffffffff0037bfffffffffff9efffffe9effffffdfffea510dffffffdd8400000dffffff200000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff","000005aefffffffd016aeffffffffffdbffffffffffffffdeffffea8fffffffdeffa5104fffffffd95100004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd","368bdfffffe00000ffffffffffe00000ffffffffffe0000097520bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe00000bddddefffffddddddfffffffffffffffdfffffffffffffff","00000000004fffff0000000039ffffff2234579dffffffffffffffffffffffffddddddddefffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff","ffffffffffffffffffffffffffffffffffffffffffffffff88888affffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff","00000000004fffff0000000039ffffff2234579dffffffffffffffffffffffffffffffffffffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff"],"2":["00049ceffdb8300003cffffffffffa103effffb9adffffc1bfffd200006ffff7ffff6000000cfffa11110000000dfff800000000008fffe2000000001affff4000000003dffff5000000017ffffc300000004dffff7000000019ffffb200000004dffff7000000008fffffdaaaaaaaaadfffffffffffffffdfffffffffffffff","00049ceffeb8200003cffffffffffa103efffc6558efffd1bfff7000001cfff7eeee00000006fffa000000000008fff800000000004effe20000000006fffe3000000001afffd3000000005dfffa100000001afffe5000000005efffa100000001afffe5000000004effff7555555555efffffffffffffffefffffffffffffff","00038ceffeb8300002bffffffffffb201dffffffffffffd19ffffa2003cffff8efffe100003ffffc33333000003ffffa0000000000affff4000000002cffff8000000005effff800000002bffffe500000006effffb10000002bffffe600000007fffffb211111119fffffffffffffffafffffffffffffffafffffffffffffff","258acefffdb84000fffffffffffffc30fffffedeffffffe3fc7310003cfffffb3000000001fffffe0000000000effffc0000000005fffff6000000005effff800000002bfffff600000006effffc30000003bffffe600000019fffffb20000005dffffc400000000ffffffffffffffffffffffffffffffffffffffffffffffff","00038ceffec9400002bffffffffffd501dffffa779effff47ffff500003efffcafffd000000affff79997000000affff00000000002efffb0000000003dfffe200000002affffd30000003affffd60000002bffffd500000007efffd500000000affffa1000000006fffffcbbbbbbbbbcfffffffffffffffffffffffffffffff","00038beffec9500002affffffffffc301dffffffffffffe29ffffe5238fffff9effff60000dffffc8888820000dffffb0000000004fffff7000000003effffd100000004effffe300000018fffffc20000004dfffff90000003bfffffc40000019fffffe60000000efffffffffffffffffffffffffffffffffffffffffffffff","00038ceffec9400002bffffffffffd401dffffb87afffff47ffff600003ffffcafffd000000affff8bbb9000000affff00000000002efffb0000000003dfffe3000000029ffffc30000003affffd50000002bffffd600000008ffffd600000000affffa1000000006fffffcbbbbbbbbbcfffffffffffffffffffffffffffffff"],"3":["00049ceffeb8200001bffffffffff8001dfffea88bffff807fffd100007fffe157774000002ffff200000000006fffd0000003667bfffd30000007fffffc5000000007ffffffea300000000014bffff400000000000cfffc99993000000afffecfffc200005ffffb4fffffdbbeffffe204cffffffffffb3000049ceffeb83000","00038ceffec8200001affffffffff9000bfffc6447dfff804fff9000001dffe026661000000afff100000000001effc00000014458effd30000005fffffc5000000004ddefffea3000000000017effe3000000000005fffb677600000002fffebfff60000009fffb2efffc8668dfffe203cffffffffffc3000049ceffec83000","00039ceffeb8200001bffffffffff7001dfffffddfffff806ffff91003effff16aaa9000008ffff30000000001cfffe1000004889dfffd30000008fffffc6000000008fffffffb300000011237effff500000000004ffffcccccb000003ffffebffffa3125dffffa3effffffffffffe303cffffffffffb2000039ceffeb83000","17acdefffec961003ffffffffffffe403ffecbbcffffffe1262000001afffff50000000001fffff50000000006ffffd000038889cffffb300007fffffffe81000007ffffffffff70000000024afffff50000000000bffffc0000000000affffd9410000005fffffafffcaaabdfffffe3fffffffffffffc3069bdefffedb84000","0016adeffec8400005effffffffffb103ffffc767bffffb09fffd10000bffff2bfff8000008ffff20000000001dfffb0000000568dfff910000000dfffffa3000000008abeffff9000000000019ffff700000000000dfffddddd6000000cfffdcfffd200006ffffa4fffffb99dffffe204dffffffffffb200005aceffeb83000","00059ceffeca500002cffffffffffd302effffffffffffe28fffff5117fffff88bbbb70000dffff90000000003effff50000029acfffff80000004ffffffb200000004fffffffd400000014459effff511111000006ffffdeffff500004fffffbffffe5104dffffd3efffffffffffff503dffffffffffe5000059ceffeda6100","0005aceffdb7200004dffffffffffa102efffe978dffffa08fffe10000cffff1bfff8000008ffff22222100000cfffc0000000457dfffb10000000dfffffa2000000009bdfffff9000000000019ffff700000000000dfffdffff7000000dfffdcfffe300008ffff94fffffc9adffffe204dffffffffffb2000059ceffdb83000"],"4":["00000002effff7000000001dfffff700000000bffffff700000007fffdfff70000003fffc5fff7000002dffc15fff700000cffe205fff700009fff5005fff70007fff90005fff7004fffc00005fff700efffa9999bfffc99ffffffffffffffffffffffffffffffff2222222227fff9220000000006fff7000000000006fff700","00000000affff40000000008fffff4000000005ffffff400000002effafff40000000cffb2fff4000000bffc12fff4000009ffe102fff400005fff4002fff40002eff80002fff4002dff900002fff400cffe766668fff966effffffffffffffeeffffffffffffffe0000000003fff5000000000003fff4000000000003fff400","00000007fffffa000000003efffffa00000001dffffffa0000000afffffffa0000006fffcbfffa000004fffe2afffa00002efff50afffa0000bfffa00afffa0008fffd100afffa005fffe3000afffa00efffdbbbbefffdbaefffffffffffffffefffffffffffffff555555555dfffb55000000000cfffa00000000000cfffa00","0000000afffff3000000006ffffff300000004fffffff30000002effdffff3000001cffa8ffff300000bffd18ffff300008ffe308ffff30005fff4008ffff3003fff70008ffff300dffa00008ffff300fffdddddeffffdddffffffffffffffffffffffffffffffff000000008ffff300000000008ffff300000000008ffff300","00000003effff8000000002dfffff800000001cffffff80000000aff9efff80000009ffa0efff8000007ffc10efff800004ffd200efff80002efe3000efff8001dff50000efff800bff922222efff922fffffffffffffffefffffffffffffffe444444444efffa44000000000efff800000000000efff800000000000efff800","00000001dffffd000000000bfffffd000000009ffffffd00000006fffffffd0000004ffffbfffd000004ffff68fffd00002efff908fffd0001dfffb008fffd000afffe1008fffd008ffff63339fffd33ffffffffffffffffffffffffffffffffffffffffffffffff222222222ffffd22000000000ffffd00000000000ffffd00","00000003effff8000000002dfffff800000001cffffff80000000affaefff80000008ffb0efff8000005ffd10efff800003ffe200efff80003efe3000efff8002dff40000efff800cff933333efffa33fffffffffffffffefffffffffffffffe666666666ffffb66000000000efff800000000000efff800000000000efff800"],"5":["08ffffffffffffb00affffffffffffb00bfffbaaaaaaaa800dfff100000000000fffe000000000002fffc048aa9610004fffcdffffffe9106fffffdbceffffc0268aa300018ffff7000000000009fffd000000000006ffff9aaa50000008fffdafffd200005ffff72effffb99cffffc003cffffffffff91000038ceffdb71000","07ffffffffffffa009ffffffffffffa00bffd555555555400effa000000000001fff8000000000003fff6158987300005fffbeffffffc5007ffffda9adffff9024684000005efff5000000000006fffb000000000002fffd888700000004fffccfff6000001cfff63ffffb6458efffb003cfffffffffe80000049ceffdb61000","0affffffffffffc00cffffffffffffc00effffffffffffc01ffff711111111102ffff500000000003ffff327aba720005ffff9fffffffa107fffffffffffffd14acefa3004dffff800001000002efffd00000000000cffffbcccb000001efffdaffffb2003cffff72efffffeefffffc102bffffffffff91000038ceffdb72000","3fffffffffffff703fffffffffffff703fffffffffffff703ffff300000000003ffff300000000003ffffbcddca720003ffffffffffffa103ffffedeffffffc12a6200003bfffff80000000000cffffd00000000008fffff0000000000affffed941000018fffff8efffdbbcffffffc1effffffffffff910269bdeffeda61000","006ffffffffffff100affffffffffff100dffdbbbbbbbbb102fff4000000000005fff1000000000009ffd5aeffda50000cfffffffffffc201ffffd877bffffd129998100005ffff800000000000bfffd000000000008fffe78884000000bfffcbfffd100007ffff64ffffea99dffffb004dfffffffffe8100005adeffdb71000","cfffffffffffffa0cfffffffffffffa0cfffffffffffffa0cffff44444444430cffff00000000000cffff17acdc94000cffffefffffffc20cfffffffffffffd2cffffe6335dffff967777300003ffffd00000000000fffffbbbbb400004ffffdbffffe8447effff83effffffffffffd103cffffffffffb2000049ceffec93000","006ffffffffffff1009ffffffffffff100dffeddddddddd101fff5000000000005fff1000000000008ffd5adeeda50000cfffffffffffc200ffffea99cffffd12cccb200006ffff800000000000bfffd000000000008fffe9aaa5000000bfffcbfffd300018ffff63effffdbceffffb003dffffffffff8000005adeffdb72000"],"6":["000049defec93000001cfffffffffa1001dffffcbcffffc10bfffc20003efff74fffe100000577759fff800367640000cfff46dfffffe700efffaffedfffffb0effffc30017ffff7dfffe1000008fffcbfffa0000004fffe7fffd0000007fffc1efff800003efff804ffffea9bffffc1004dfffffffff91000005adffec82000","000049cefed94000001bfffffffffc2002dfffb767cfffd10afff5000008fff83fff7000000166658fff100466520000cffc18efffffc600effcdffcbdffffa0fffff810003cfff6efff80000002fffdbfff30000000cfff7fff50000000effe1effd3000009fff905ffff9557cfffd1004dfffffffffa2000005adffec82000","000049defec93000001afffffffffb1002dfffffffffffc10bffffa313bffff83ffff9000009aaa89ffff20257751000cfffd2afffffe920dfffddffffffffd1efffff9324bffff9dffff800000dfffeaffff4000009ffff6ffff600000bfffe1dfffe50018ffff904ffffffefffffd1003cfffffffffa2000004adffec83000","000027bdfffdc9500008ffffffffffa001cffffebaabefa00bffff91000003404ffff90000000000affff21566520000dffffbffffffc600ffffffffffffffb0ffffff7103dffff7effffb00004ffffccffff800001ffffe7ffff900002ffffd1efffe10007ffff805ffffd88affffd1004efffffffffb2000016bdffec94000","00016adeffda7100004efffffffffe4004ffffb767dfffe21efff900001abbb66ffff20000000000afffc01466520000dfffb9efffffd710effffffedfffffc1fffffb20018ffff8efffd000000afffecfff90000007ffff8fffb0000009fffd2ffff700005ffff808ffffd99cffffd1007efffffffffa1000017bdffec82000","00038ceffec93000009ffffffffff90008fffffdefffff802ffffb1004fffff17ffff20000577772bfffc00144310000efffa6dfffffc600ffffefffffffff90ffffffdaacfffff7effff700008ffffdbffff100001fffff7ffff300003ffffe1efffd6446dffff907ffffffffffffe1008ffffffffffc2000027bdffec94000","000049cefeda5000003cfffffffffd4003efffd878efffe20cfffa00002cddd65ffff20000000000afffd01466520000dfffb8efffffd700efffffffffffffb1fffffc30029ffff8efffd100000bfffddfff90000007ffffafffb0000009fffd4ffff700005ffff80affffda9cffffd1009ffffffffffb2000027bdffec83000"],"7":["ffffffffffffffffffffffffffffffffaaaaaaaaaaafffff00000000007ffff70000000003ffffb0000000001dfffe2000000000affff40000000005ffff80000000001dfffc0000000000afffe20000000006ffff50000000003ffff90000000000cfffd10000000009fffe30000000006ffff70000000002efffd000000000","effffffffffffffeeffffffffffffffe55555555555bfffc00000000003efff30000000000cfff700000000009fffb00000000005fffd10000000002efff40000000000cfff800000000008fffb00000000005fffe20000000001efff50000000000bfff900000000007fffc10000000004fffe20000000001dfff6000000000","ffffffffffffffffffffffffffffffffffffffffffffffff1111111111cffffa0000000006ffffd1000000002effff4000000000cffff80000000008ffffd1000000004fffff4000000001effff7000000000affffb0000000004ffffe1000000001effff6000000000bffffb0000000008ffffd1000000003fffff400000000","fffffffffffffffefffffffffffffffefffffffffffffffb0000000003fffff3000000000cffff80000000006ffffe1000000001effff50000000009ffffb0000000004fffff2000000000cffff80000000005ffffd1000000001effff50000000009ffffb0000000003fffff2000000000cffff80000000006ffffd10000000","ffffffffffffffffffffffffffffffffdddddddddddefffe00000000006fffc20000000007fffc10000000008fffc10000000007fffd20000000004ffff40000000001dfff800000000008fffd10000000001efff700000000007fffe10000000000dfff800000000003ffff300000000006fffe00000000000afffc00000000","ffffffffffffffffffffffffffffffffffffffffffffffff4444444444effff90000000008ffffe1000000003fffff6000000001dffffa0000000009ffffd1000000003fffff5000000001dffffb0000000008fffff2000000003fffff7000000000cffffd0000000006fffff4000000002effff9000000000ceeeec00000000","ffffffffffffffffffffffffffffffffdddddddddddefffe00000000005fffd20000000006fffd10000000006fffd10000000006fffe20000000004ffff40000000001efff700000000009fffd00000000002ffff600000000008fffe00000000000efff800000000003ffff300000000007fffe00000000000afffc00000000"],"8":["00038ceffec83000009ffffffffff9000affffa77affffa02ffff500005ffff33ffff000000ffff30dfff500005fffd002cfff9669fffd200006effffffd600002affffffffffa203efffa2002afffe3bfffa000000bfffbefff70000008fffecfffd100001dfffc4ffffe9669effff403cffffffffffc4000049ceffec83000","00038ceffec83000019ffffffffffa1009fffc6335cfffa01fffc000000cfff21fff90000009fff20cffd100001dffd003dffd7447dffd300006effffffd610002affffddffffa202effe610016effe3bfff30000004fffceffe00000001ffffcfff50000006fffd4ffffa5335affff404cffffffffffd4000049ceffec94000","00038beffec8300001affffffffffa100affffebbeffffb02ffffd1001cffff33ffff700007ffff30dfffb0000bfffd003dfffc88cfffd300007effffffd610003bffffffffffb303efffe6226efffe3bffff400004ffffbeffff200001ffffebffff910009ffffc3fffffebbefffff403cffffffffffc4000048ceffec83000","0027bdeffedb720006efffffffffff604fffffc88bfffff48ffffb0000affff98ffff700007ffff94ffffc0000bffff405efffdaadfffe60001affffffffa10007effffddffffe707ffffb2001affff8effff200002ffffefffff100001fffffdffff700006ffffe7fffffb88bfffff808ffffffffffff800027bdeffedb7200","00049ceffec8300001bffffffffffa100cfffd8668efffb04fffd100001dfff24fffa000000afff31dffe400004effc002afffcaacfff910005dffffffffc4001bfffe8669efffa1afffd100002efff9ffff70000008fffeffff70000008fffecfffe300004efffb3fffffb99cffffe203cffffffffffb2000049ceffec83000","0005aceffeca500002dffffffffffd200dfffffeefffffd05ffffd3002dffff55ffff800008ffff51efffb0000bfffe105efffd99dfffe40006fffffffffe5000afffffdefffffa08ffff91002bffff8efffd000001ffffeefffe100002ffffebffffb3014cffffb2effffffffffffe203cffffffffffc3000049ceffec94000","00027beffeb7200001affffffffff9100bfffea77aefffa03fffe200002efff24fffa000000afff31effe200003effd003dfffa77afffd30003dffffffffc2001affffb99cffff809fffe300004efff8ffff70000009fffeffff70000008ffffdfffe300004efffb4fffffc99cfffff304dffffffffffc3000049ceffec94000"],"9":["00049ceffda6100001bfffffffffe4001dffffa89dffff408fffd200008fffe1dfff5000000dfff7efff2000000bfffbcfff8000002efffd7ffff81004dffffe0afffffdeffafffd006efffffd56fffc000046663009fff969995000001efff36fffe50003cfffa00bffffecdffffc10019fffffffff910000028cefec920000","00049ceffdb6100001bfffffffffe5001cfffc6458efff608fff7000001dffe1dffd00000005fff8fffb00000004fffdcffe20000009ffff5fffd400019fffff08ffffdccffbdfff004cfffffe81dffd000024553002fff9577700000008fff36fff9000006fffb00cfffd878cfffd2001afffffffffa20000039cefec930000","00038ceffdb6100001afffffffffe5001cfffffddfffff608ffffa1003dffff2cfffd000004ffff8efffb000001ffffdcfffe200007fffff7ffffd6338ffffff0bffffffffecffff007efffffb2bfffe00004665201efffa7cccc200008ffff55ffffd5349ffffc00afffffffffffe20008effffffffa20000017cefed930000","00049ceffdb6100002bfffffffffe4001dffffa89dffff508ffff70001dfffe1dffff200009ffff7effff100008ffffccffff50000bffffe7ffffe745affffff0bffffffffffffff006cffffffaffffd00002566412ffffa0000000000affff40430000019ffffb00afebaacfffffc100affffffffff8000059cefffdb720000","00049ceffeb7100001bfffffffffe5001dfffd866affff608fffd100005fffe1cfff7000000cfff7dfff6000000afffbbfffa000001efffd5ffff81003cffffe09fffffdeffffffd006effffffbafffb00004677630bfff800000000001efff47fffe20001afffc02efffea9aefffe2003cfffffffffc3000005adffeda40000","00059cefedb8300002cffffffffff9002effffffffffff80affffe6336effff2effff300003ffff8fffff100001ffffccffff910008ffffe5fffffecceffffff07ffffffffffffff004aeffffc69fffe00000122000afffb39999600001efff82fffff5001affff208fffffedfffff80008ffffffffffa0000038ceffec94000","00038ceffeb7100002bfffffffffe7001dfffe978bffff708fffd200006ffff2cfff7000000cfff7dfff6000000afffbbfffa000001efffd5ffff93125cffffd09fffffffffffffd007effffffaafffb00004788730bfff812221000001efff47fffe20001bfffb01efffeb9aefffe2003cfffffffffc30000049defeda40000"],"?":["00049ceffec9500005dffffffffffd605fffffc99dfffff6cffff400007ffffd77775000001ffffe0000000001bffffa000000018effffc10000008effffc600000007ffffc4000000000cfffc00000000000dfff80000000000000000000000000003786100000000005ffffd10000000007fffff200000000019efd5000000","00049ceffec9510005dffffffffffe705ffffd7447dffff8cfffb000000bfffe555520000009ffff00000000004efffb000000004bffffc20000004dffffc600000002efffb30000000007fffb00000000000afff60000000000000000000000000000353000000000002dfffb00000000005fffff100000000008dfd6000000","0016adeffeda720005efffffffffff805ffffffddffffff8cffffa1002dffffe88888200009fffff0000000004effffb00000006cfffffd2000001cfffffe81000000affffe6100000000fffff30000000001ddddc0000000000000000000000000018ccb700000000009fffff60000000009fffff700000000019efd8000000","58acdefffeca6100ffffffffffffff80ffffdbbcfffffff9e95100001affffff0000000004ffffff000000003dfffff900000019ffffffb0000007efffffd6000000afffffe700000004ffffff5000000004bbbbbb10000000000000000000000005dddddd1000000005ffffff1000000005ffffff1000000005ffffff100000","00049ceffec8300002cffffffffffb201dffffc99cffffe28ffff500005efffacfff90000009fffe999940000009fffe00000000005ffff9000000003affffb100000009ffffe6000000008ffff81000000001ffff400000000002bbbb0000000000012222100000000007ffff800000000007ffff800000000007ffff800000","0015adeffeda610005effffffffffe504ffffffffffffff6cffffd4116fffffd9aaaa40000cfffff0000000003effffd00068889cffffff6000cfffffffffc50000cffffecb84000000cffff60000000000566663000000000000000000000000005cfeb30000000005fffffe1000000006ffffff20000000007dffc50000000","00059ceffeb8300003dffffffffffb302effffd99dffffe3affff600006ffffbefff9000000bffffaaaa3000000bffff00000000007ffffa000000004cffffb100000009ffffd6000000008fffe60000000000efff200000000001aaa90000000000013333100000000006ffff600000000006ffff600000000006ffff600000"]};
+const DIGITS = Object.fromEntries(Object.entries(DIGIT_SRC).map(([ch, L]) => [ch, L.map(hex => Float32Array.from(hex, c => parseInt(c, 16) / 15))]));
+function bandGrayBilinear(rgba, W, H, b, K) {
+  const w = Math.round(b.w * K), h = Math.round(b.h * K), g = new Uint8Array(w * h);
+  const lum = i => (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) / 256;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const fx = Math.min(W - 1.001, b.x + x / K), fy = Math.min(H - 1.001, b.y + y / K), x0 = fx | 0, y0 = fy | 0, ax = fx - x0, ay = fy - y0;
+    const p = (yy, xx) => lum((yy * W + xx) * 4);
+    g[y * w + x] = (p(y0, x0) * (1 - ax) + p(y0, x0 + 1) * ax) * (1 - ay) + (p(y0 + 1, x0) * (1 - ax) + p(y0 + 1, x0 + 1) * ax) * ay;
+  }
+  return { g, w, h };
+}
+// Read the characters on a binarised chip (ink = 0). Returns one score map {char: similarity} per character.
+function readChars(bin, w, h, n) {
+  const lab = new Int32Array(w * h), st = new Int32Array(w * h), comps = [], dots = []; let id = 0;
+  for (let s0 = 0; s0 < w * h; s0++) {
+    if (bin[s0] || lab[s0]) continue;
+    id++; let sp = 0; st[sp++] = s0; lab[s0] = id; let minx = w, maxx = 0, miny = h, maxy = 0, area = 0;
+    while (sp) {
+      const p = st[--sp], x = p % w, y = (p / w) | 0; area++;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && !bin[p - 1] && !lab[p - 1]) { lab[p - 1] = id; st[sp++] = p - 1; }
+      if (x < w - 1 && !bin[p + 1] && !lab[p + 1]) { lab[p + 1] = id; st[sp++] = p + 1; }
+      if (y > 0 && !bin[p - w] && !lab[p - w]) { lab[p - w] = id; st[sp++] = p - w; }
+      if (y < h - 1 && !bin[p + w] && !lab[p + w]) { lab[p + w] = id; st[sp++] = p + w; }
+    }
+    const bw = maxx - minx + 1, bh = maxy - miny + 1;
+    if (minx === 0 || miny === 0 || maxx === w - 1 || maxy === h - 1) continue;
+    if (bh < 0.1 * h) { if (area >= 3) dots.push({ cx: (minx + maxx) / 2, miny, maxy, bh, bw }); continue; }
+    if (bh > 0.7 * h || area < 10 || bw > 6 * bh) continue;
+    comps.push({ id, minx, maxx, miny, maxy, bw, bh, cy: (miny + maxy) / 2 });
+  }
+  if (!comps.length) return [[]];
+  let line = [];                                  // largest set of same-height parts on one line
+  for (const c of comps) {
+    const grp = comps.filter(o => Math.abs(o.bh - c.bh) <= 0.2 * c.bh && Math.abs(o.cy - c.cy) <= 0.25 * c.bh);
+    if (grp.length > line.length || (grp.length === line.length && c.bh > line[0].bh)) line = grp;
+  }
+  const colInk = (c, x) => { let k = 0; for (let y = c.miny; y <= c.maxy; y++) if (lab[y * w + x] === c.id) k++; return k; };
+  const scorePart = ([c, xa, xb]) => {
+    let miny = h, maxy = 0;
+    for (let y = c.miny; y <= c.maxy; y++) for (let x = xa; x <= xb; x++) if (lab[y * w + x] === c.id) { if (y < miny) miny = y; if (y > maxy) maxy = y; }
+    if (maxy < miny) return null;
+    const bw = xb - xa + 1, bh = maxy - miny + 1, grid = new Float32Array(G * G), tot = new Float32Array(G * G);
+    for (let y = miny; y <= maxy; y++) for (let x = xa; x <= xb; x++) {
+      const k = Math.min(G - 1, ((y - miny) * G / bh) | 0) * G + Math.min(G - 1, ((x - xa) * G / bw) | 0);
+      tot[k]++; if (lab[y * w + x] === c.id) grid[k]++;
+    }
+    for (let i = 0; i < G * G; i++) grid[i] = tot[i] ? grid[i] / tot[i] : 0;
+    const sc = {};
+    for (const ch in DIGITS) { let m = 0; for (const t of DIGITS[ch]) m = Math.max(m, iou(grid, t)); sc[ch] = m; }
+    if (bw < 0.42 * bh) sc["1"] = Math.max(sc["1"], 0.75);            // a narrow upright stroke is a 1
+    // "?" = a hook with a separate dot directly underneath (the dot is too small to be a character)
+    if (dots.some(d => d.cx >= xa - 0.15 * bw && d.cx <= xb + 0.15 * bw && d.miny > maxy && d.miny - maxy < 0.6 * bh && d.bh < 0.35 * bh)) {
+      sc["?"] = 1; for (const k in sc) if (k !== "?") sc[k] = Math.min(sc[k], 0.3);
+    }
+    return sc;
+  };
+  // Touching characters: split the widest blob at its thinnest column until we reach the expected count
+  // Group into runs of tightly spaced characters (separates the ↓ arrow and stray marks from the chip text)
+  const sorted = line.map(c => [c, c.minx, c.maxx]).sort((p, q) => p[1] - q[1]);
+  const mh = sorted.map(p => p[0].bh).sort((x, y) => x - y)[sorted.length >> 1];
+  const runs = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i][1] - sorted[i - 1][2] > 0.6 * mh) runs.push([]);
+    runs[runs.length - 1].push(sorted[i]);
+  }
+  const hyps = [];
+  for (const base of runs) {
+    hyps.push(base);
+    let P = base.slice();
+    while (P.length < n) {         // touching characters: split the widest blob at its thinnest column
+      let wi = -1, wr = 0.75;
+      P.forEach(([c, xa, xb], i) => { const r = (xb - xa + 1) / c.bh; if (r > wr) { wr = r; wi = i; } });
+      if (wi < 0) break;
+      const [c, xa, xb] = P[wi], W0 = xb - xa + 1;
+      let cut = -1, ci = 1e9;
+      for (let x = xa + Math.round(0.3 * W0); x <= xa + Math.round(0.7 * W0); x++) { const k = colInk(c, x); if (k < ci) { ci = k; cut = x; } }
+      P.splice(wi, 1, [c, xa, cut - 1], [c, cut + 1, xb]);
+    }
+    if (P.length !== base.length) hyps.push(P);
+  }
+  return hyps.map(P => P.map(scorePart).filter(Boolean));
+}
+// Decode a chip: best window of n characters read as a permutation of 1..n, or "????" (hidden)
+function decodeChip(chars, n) {
+  let best = null;
+  if (chars.length === n) for (let i = 0; i < 1; i++) {
+    const win = chars;
+    const S = win.map(sc => Array.from({ length: n }, (_, d) => sc[String(d + 1)]));
+    const p = bestPerm(S, Array.from({ length: n }, (_, d) => d));
+    const permMean = p.s / n, qMean = win.reduce((m, sc) => m + sc["?"], 0) / n;
+    const minDigit = Math.min(...p.perm.map((d, k) => S[k][d]));
+    const cand = { op: p.perm.map(d => d + 1).join(""), permMean, qMean, minDigit };
+    if (!best || permMean - qMean > best.permMean - best.qMean) best = cand;
+  }
+  if (!best) return { kind: "none" };
+  if (best.qMean >= best.permMean) return { kind: "hidden" };
+  if (best.permMean >= 0.5 && best.minDigit >= 0.38 && best.permMean - best.qMean >= 0.04) return { kind: "op", op: best.op, conf: best.permMean };
+  return { kind: "none" };
+}
+const CHIP_VARIANTS = [[0.6, 18], [1.0, 25], [0.4, 12], [1.4, 30], [0.8, 35]];
+function chipOp(text, n) {
+  if (isPerm(text, n)) return text;
+  for (let i = 1; i + n <= text.length; i++) if (isPerm(text.slice(i, i + n), n)) return text.slice(i, i + n);   // arrow read as a char
+  return null;
+}
+function readOps(src, r, debug, info) {
+  const n = r.top.length, res = [null, null];
+  const rects = chipRects(r, src.W / src.scale, src.H / src.scale);
+  for (let c = 0; c < 2; c++) {
+    const rw = rects[c], sc = src.scale;
+    const b = { x: Math.round(rw.x * sc), y: Math.round(rw.y * sc), w: Math.round(rw.w * sc), h: Math.round(rw.h * sc), s: rw.s * sc };
+    const K = Math.max(1, Math.min(4, 70 / b.s));
+    const { g, w, h } = bandGrayBilinear(src.rgba, src.W, src.H, b, K);
+    const votes = {};
+    for (const [f, C] of CHIP_VARIANTS) {
+      const hyps = readChars(binarizeText(g, w, h, Math.max(3, Math.round(f * b.s * K)), C), w, h, n);
+      let d = { kind: "none" };
+      for (const chars of hyps) {
+        const x = decodeChip(chars, n);
+        if (x.kind === "hidden" && d.kind === "none") d = x;
+        if (x.kind === "op" && (d.kind !== "op" || x.conf > d.conf)) d = x;
+      }
+      const key = d.kind === "op" ? d.op : d.kind;
+      if (debug) debug.push(c + ":" + key);
+      if (key !== "none") votes[key] = (votes[key] || 0) + 1;
+      if (votes[key] >= 3) break;
+    }
+    const ops = Object.keys(votes).filter(k => k !== "hidden").sort((x, y) => votes[y] - votes[x]);
+    if (ops.length && votes[ops[0]] >= 2 && (ops.length === 1 || votes[ops[0]] > votes[ops[1]] + 1) && votes[ops[0]] >= (votes.hidden || 0)) res[c] = ops[0];
+    else if (votes.hidden && !ops.some(k => votes[k] >= 2)) res[c] = "hidden";
+  }
+  if (info) info.res = res.slice();
+  const [a, b] = res, isOp = k => k && k !== "hidden";
+  if (isOp(a) && b === "hidden") return { first: a };     // one chip clearly an operator, the other clearly ????
+  if (isOp(b) && a === "hidden") return { second: b };
+  return null;      // neither or both chips read as an operator -> don't guess
+}
+function solveTwoStepInv(top, bottom, ops) {   // alternative convention: digit i = where input i goes
+  const applyInv = (op, row) => { const o = []; op.forEach((d, i) => o[d - 1] = row[i]); return o; };
+  const deriveInv = (from, to) => from.map(x => to.indexOf(x) + 1).join("");
+  if (ops.first) return deriveInv(applyInv(ops.first.split("").map(Number), top), bottom);
+  if (ops.second) { const op = ops.second.split("").map(Number); return deriveInv(top, op.map(d => bottom[d - 1])); }
+  return null;
+}
 // order: indices of methods to try (all if omitted). Returns result with .mi = method index.
 function solve(rgba, w, h, manualT, order) {
   const g = toGray(rgba, w * h);
@@ -382,6 +618,30 @@ function solve(rgba, w, h, manualT, order) {
 const $ = id => document.getElementById(id);
 const view = $("view"), vctx = view.getContext("2d");
 const WORK_LIVE = 900;
+const srcCv = document.createElement("canvas"), srcCtx = srcCv.getContext("2d", { willReadFrequently: true });
+const twoCache = new Map();
+let pendingTwo = null;   // rows signature -> solved two-step result
+let lastShownAt = 0;
+function grabSource(src, sw, sh) {
+  const W = Math.min(sw, 1440), H = Math.round(sh * W / sw);
+  if (srcCv.width !== W || srcCv.height !== H) { srcCv.width = W; srcCv.height = H; }
+  srcCtx.drawImage(src, 0, 0, W, H);
+  return { rgba: srcCtx.getImageData(0, 0, W, H).data, W, H, scale: W / work.width };
+}
+// Turn a raw row read into a final answer (handles single- and two-operator levels)
+function finalize(r, src, sw, sh) {
+  if (!r) return null;
+  if (!isTwoStep(r)) return Object.assign(r, { kind: "single" });
+  const key = r.top.join() + "|" + r.bottom.join();
+  let hit = twoCache.get(key);
+  if (!hit) {
+    const info = {}, ops = readOps(grabSource(src, sw, sh), r, null, info);
+    if (!ops) pendingTwo = { r, key, guessChip: info.res && info.res[0] === "hidden" ? "second" : "first" };
+    if (ops) { const a = solveTwoStep(r.top, r.bottom, ops); hit = { ops, code: a.code, inverse: solveTwoStepInv(r.top, r.bottom, ops) }; twoCache.set(key, hit); }
+  }
+  if (!hit) return Object.assign(r, { kind: "two", code: null, pending: true });
+  return Object.assign(r, { kind: "two", ops: hit.ops, code: hit.code, inverse: hit.inverse });
+}
 const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
 let manualT = null, preferred = 0, rot = 0, lastCode = null, liveOn = false, streak = 0, pending = null;
 
@@ -393,11 +653,19 @@ $("thr").addEventListener("input", e => {
 
 function show(r) {
   const code = $("code");
+  code.classList.remove("stale");
   code.textContent = r.code; code.classList.add("ok");
   if (r.code !== lastCode) { code.classList.add("flash"); setTimeout(() => code.classList.remove("flash"), 180); }
   lastCode = r.code;
-  $("rows").textContent = r.top.map(glyph).join(" ") + "  →  " + r.bottom.map(glyph).join(" ");
-  $("inv").textContent = "Not an option? Try " + r.inverse;
+  lastShownAt = performance.now();
+  if (r.kind === "two") {
+    const o = r.ops, a = o.first || "????", b = o.second || "????";
+    $("rows").innerHTML = r.top.map(glyph).join(" ") + ` <small>→${a}→</small> ? <small>→${b}→</small> ` + r.bottom.map(glyph).join(" ");
+    $("inv").textContent = "Hidden " + (o.first ? "2nd" : "1st") + " operator · not an option? Try " + r.inverse;
+  } else {
+    $("rows").textContent = r.top.map(glyph).join(" ") + "  →  " + r.bottom.map(glyph).join(" ");
+    $("inv").textContent = "Not an option? Try " + r.inverse;
+  }
 }
 
 // Run detection on a video frame or image; draw boxes on the view canvas.
@@ -462,7 +730,8 @@ function recompute() {          // re-derive the code from the corrected shapes 
   const T = held.rowA.map(b => b.glyph), B = held.rowB.map(b => b.glyph);
   renderTeach(held);
   if (new Set(T).size === T.length && B.every(x => T.includes(x)) && new Set(B).size === B.length) {
-    show({ ...held, top: T, bottom: B, code: B.map(x => T.indexOf(x) + 1).join(""), inverse: T.map(x => B.indexOf(x) + 1).join("") });
+    if (held.kind === "two" && held.ops) show({ ...held, top: T, bottom: B, code: solveTwoStep(T, B, held.ops).code, inverse: solveTwoStepInv(T, B, held.ops) });
+    else show({ ...held, top: T, bottom: B, code: B.map(x => T.indexOf(x) + 1).join(""), inverse: T.map(x => B.indexOf(x) + 1).join("") });
     $("status").textContent = "Corrected & learned ✓";
   } else $("status").textContent = "Learned. Rows don't match yet — correct the other symbols too.";
 }
@@ -472,6 +741,36 @@ $("freeze").onclick = () => { frozen = true; const v = $("video"); try { v.pause
 $("unfreeze").onclick = () => { frozen = false; const v = $("video"); try { v.play(); } catch (e) {} };
 let lastGood = null;
 loadLearned();
+// ---------- Fallback keypad for unreadable operator chips ----------
+let kp = { which: "first", digits: "" };
+function kpRender() {
+  if (!pendingTwo) { $("keypad").style.display = "none"; return; }
+  const n = pendingTwo.r.top.length;
+  $("keypad").style.display = "block";
+  $("kpFirst").className = kp.which === "first" ? "primary" : ""; $("kpSecond").className = kp.which === "second" ? "primary" : "";
+  $("kpShow").textContent = (kp.digits + "____".repeat(2)).slice(0, n);
+  const keys = $("kpKeys"); keys.innerHTML = "";
+  for (let d = 1; d <= n; d++) { const b = document.createElement("button"); b.textContent = d; b.disabled = kp.digits.includes(String(d)); b.onclick = () => kpPress(String(d)); keys.appendChild(b); }
+  const bk = document.createElement("button"); bk.textContent = "⌫"; bk.onclick = () => { kp.digits = kp.digits.slice(0, -1); kpRender(); }; keys.appendChild(bk);
+}
+function kpPress(d) {
+  const P = pendingTwo, n = P.r.top.length; kp.digits += d;
+  if (kp.digits.length === n) {
+    const ops = { [kp.which]: kp.digits }, a = solveTwoStep(P.r.top, P.r.bottom, ops);
+    twoCache.set(P.key, { ops, code: a.code, inverse: solveTwoStepInv(P.r.top, P.r.bottom, ops) });
+    show(Object.assign(P.r, { kind: "two", ops, code: a.code, inverse: solveTwoStepInv(P.r.top, P.r.bottom, ops) }));
+    $("status").textContent = "Solved from typed operator ✓"; pendingTwo = null; kp.digits = "";
+  }
+  kpRender();
+}
+$("kpFirst").onclick = () => { kp.which = "first"; kpRender(); };
+$("kpSecond").onclick = () => { kp.which = "second"; kpRender(); };
+let kpShownKey = null;
+function kpMaybeShow() {           // called each frame: show keypad only for a level still unsolved
+  if (pendingTwo && twoCache.has(pendingTwo.key)) pendingTwo = null;
+  const key = pendingTwo ? pendingTwo.key : null;
+  if (key !== kpShownKey) { kpShownKey = key; kp.digits = ""; if (pendingTwo) kp.which = pendingTwo.guessChip; kpRender(); }
+}
 
 // Photo mode
 $("snap").addEventListener("change", e => {
@@ -480,9 +779,11 @@ $("snap").addEventListener("change", e => {
   const img = new Image(), url = URL.createObjectURL(f);
   img.onload = () => {
     $("stage").classList.remove("live");
-    const r = analyze(img, img.naturalWidth, img.naturalHeight, 1024, true);
+    const r = finalize(analyze(img, img.naturalWidth, img.naturalHeight, 1024, true), img, img.naturalWidth, img.naturalHeight);
     URL.revokeObjectURL(url); e.target.value = "";
-    if (r) { show(r); lastGood = r; renderTeach(r); $("status").textContent = "Photo read OK · " + r.method; }
+    kpMaybeShow();
+    if (r && r.pending) $("status").textContent = "Two-operator level: chip unreadable — retake sharper, or type the digits below";
+    else if (r) { show(r); lastGood = r; renderTeach(r); $("status").textContent = "Photo read OK · " + r.method + (r.kind === "two" ? " · two-step" : ""); }
     else $("status").textContent = `No read · ${lastStats.blobs} shapes seen · ${lastStats.segs} rows — fill more of the frame with the puzzle and hold steady`;
   };
   img.src = url;
@@ -496,6 +797,9 @@ $("live").addEventListener("click", async () => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no camera API (open in Safari, over https)");
     const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
     v.srcObject = stream;
+    try { const tr = stream.getVideoTracks()[0], cap = tr.getCapabilities ? tr.getCapabilities() : {};
+      const adv = {}; if (cap.focusMode && cap.focusMode.includes("continuous")) adv.focusMode = "continuous";
+      if (Object.keys(adv).length) await tr.applyConstraints({ advanced: [adv] }); } catch (e) {}
     $("stage").classList.add("live");          // video must be visible on iOS or it delivers no frames
     await v.play();
   } catch (err) {
@@ -509,15 +813,19 @@ $("live").addEventListener("click", async () => {
       let r = null;
       const n = methods(WORK_LIVE).length, order = [preferred];
       for (let k = 0; order.length < 3 && k < n; k++) { rot = (rot + 1) % n; if (rot !== preferred) order.push(rot); }
-      try { r = analyze(v, v.videoWidth, v.videoHeight, WORK_LIVE, false, order); if (r && r.mi >= 0) preferred = r.mi; }
+      try { r = finalize(analyze(v, v.videoWidth, v.videoHeight, WORK_LIVE, false, order), v, v.videoWidth, v.videoHeight); if (r && r.mi >= 0) preferred = r.mi; }
       catch (err) { $("status").textContent = "Scan error: " + err.message; }
+      if (r && r.pending) { r = null; $("code").classList.add("stale"); }
+      else if (r && r.kind === "single") pendingTwo = null;
+      kpMaybeShow();
       if (r) lastGood = r;
       if (r && r.code === pending) { if (++streak >= 2) show(r); }
       else { pending = r ? r.code : null; streak = r ? 1 : 0; }
+      if (performance.now() - lastShownAt > 1500) $("code").classList.add("stale");   // old answer greys out
       frames++;
       const now = performance.now();
       if (now - t0 > 1000) { fps = Math.round(frames * 1000 / (now - t0)); frames = 0; t0 = now; }
-      $("status").textContent = `live ${fps} fps · ${v.videoWidth}×${v.videoHeight} · ${lastStats.blobs} shapes · ${lastStats.segs} rows` + (r ? " · ✓ " + r.method : "");
+      $("status").textContent = `live ${fps} fps · ${v.videoWidth}×${v.videoHeight} · ${lastStats.blobs} shapes · ${lastStats.segs} rows` + (r ? " · ✓ " + r.method + (r.kind === "two" ? " · two-step" : "") : (lastStats.blobs && $("code").classList.contains("stale") ? "" : ""));
     }
     setTimeout(tick, 20);
   };
