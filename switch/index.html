@@ -23,8 +23,10 @@
   button.primary, label.primary { background:var(--cyan); color:#001018; border-color:var(--cyan); }
   input[type=file] { display:none; }
   .stage { position:relative; border-radius:16px; overflow:hidden; border:1px solid var(--line); background:#000; }
-  video { display:none; width:100%; }
+  video { display:none; width:100%; height:auto; }
   canvas#view { display:block; width:100%; height:auto; }
+  .stage.live video { display:block; }
+  .stage.live canvas#view { position:absolute; left:0; top:0; width:100%; height:100%; }
   .row { display:flex; align-items:center; gap:10px; margin-top:12px; font:12px ui-monospace, Menlo, monospace; color:var(--dim); }
   .row input[type=range] { flex:1; accent-color:var(--cyan); }
   .tips { font-size:13px; color:var(--dim); margin-top:14px; }
@@ -48,7 +50,7 @@
   </div>
   <input id="snap" type="file" accept="image/*" capture="environment">
 
-  <div class="stage">
+  <div class="stage" id="stage">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="view" width="640" height="360"></canvas>
   </div>
@@ -190,8 +192,10 @@ function segments(bs) {
   return segs;
 }
 
+let lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
 function solveAt(g, w, h, t) {
-  const segs = segments(blobs(g, w, h, t));
+  const bs = blobs(g, w, h, t), segs = segments(bs);
+  if (bs.length >= lastStats.blobs) lastStats = { blobs: bs.length, segs: segs.length, t, list: bs };
   const mean = (seg, k) => seg.reduce((s, b) => s + b[k], 0) / seg.length;
   let best = null;
   for (const A of segs) for (const B of segs) {
@@ -214,6 +218,7 @@ function solveAt(g, w, h, t) {
 
 function solve(rgba, w, h, manualT) {
   const g = toGray(rgba, w * h);
+  lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
   if (manualT != null) return solveAt(g, w, h, manualT);
   const o = otsu(g);
   const tries = [o, 150, 180, 120, 205, 100, o + 30, o - 30];
@@ -225,9 +230,8 @@ function solve(rgba, w, h, manualT) {
 <script>
 // ---------- UI ----------
 const $ = id => document.getElementById(id);
-const view = $("view"), vctx = view.getContext("2d", { willReadFrequently: true });
+const view = $("view"), vctx = view.getContext("2d");
 const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
-const WORK_W = 1024;
 let manualT = null, lastCode = null, liveOn = false, streak = 0, pending = null;
 
 $("thr").addEventListener("input", e => {
@@ -236,65 +240,78 @@ $("thr").addEventListener("input", e => {
   $("thrv").textContent = manualT == null ? "auto" : manualT;
 });
 
-function show(r, msg) {
+function show(r) {
   const code = $("code");
-  if (!r) { $("status").textContent = msg || "Couldn't read both rows — retake with less glare."; return; }
   code.textContent = r.code; code.classList.add("ok");
   if (r.code !== lastCode) { code.classList.add("flash"); setTimeout(() => code.classList.remove("flash"), 180); }
   lastCode = r.code;
   $("rows").textContent = r.top.map(x => GLYPH[x]).join(" ") + "  →  " + r.bottom.map(x => GLYPH[x]).join(" ");
   $("inv").textContent = "Not an option? Try " + r.inverse;
-  $("status").textContent = "Read OK · threshold " + r.threshold;
 }
 
-function analyzeSource(src, sw, sh, ww = WORK_W) {
-  const scale = ww / sw, w = ww, h = Math.round(sh * scale);
-  work.width = w; work.height = h;
+// Run detection on a video frame or image; draw boxes on the view canvas.
+function analyze(src, sw, sh, ww, drawImage) {
+  const w = ww, h = Math.round(sh * ww / sw);
+  if (work.width !== w || work.height !== h) { work.width = w; work.height = h; }
   wctx.drawImage(src, 0, 0, w, h);
-  const img = wctx.getImageData(0, 0, w, h);
-  const r = solve(img.data, w, h, manualT);
-  // Draw preview with detections
-  view.width = w; view.height = h;
-  vctx.drawImage(work, 0, 0);
+  const r = solve(wctx.getImageData(0, 0, w, h).data, w, h, manualT);
+  if (view.width !== w || view.height !== h) { view.width = w; view.height = h; }
+  if (drawImage) vctx.drawImage(work, 0, 0); else vctx.clearRect(0, 0, w, h);
+  vctx.lineWidth = 2; vctx.strokeStyle = "rgba(255,255,255,.45)";
+  for (const b of lastStats.list) vctx.strokeRect(b.minx - 2, b.miny - 2, b.bw + 4, b.bh + 4);   // everything seen
   if (r) {
-    vctx.lineWidth = 3; vctx.strokeStyle = "#39ff9c"; vctx.fillStyle = "#39ff9c"; vctx.font = "bold 16px ui-monospace, monospace";
-    for (const b of r.blobs) { vctx.strokeRect(b.minx - 3, b.miny - 3, b.bw + 6, b.bh + 6); vctx.fillText(GLYPH[b.glyph], b.minx, b.miny - 6); }
+    vctx.lineWidth = 4; vctx.strokeStyle = "#39ff9c"; vctx.fillStyle = "#39ff9c"; vctx.font = "bold 18px ui-monospace, monospace";
+    for (const b of r.blobs) { vctx.strokeRect(b.minx - 4, b.miny - 4, b.bw + 8, b.bh + 8); vctx.fillText(GLYPH[b.glyph], b.minx, b.miny - 8); }
   }
   return r;
 }
 
-// Photo mode (works everywhere, including inside the Claude app)
+// Photo mode
 $("snap").addEventListener("change", e => {
   const f = e.target.files && e.target.files[0]; if (!f) return;
   $("status").textContent = "Reading…";
   const img = new Image(), url = URL.createObjectURL(f);
   img.onload = () => {
-    const r = analyzeSource(img, img.naturalWidth, img.naturalHeight);
+    $("stage").classList.remove("live");
+    const r = analyze(img, img.naturalWidth, img.naturalHeight, 1024, true);
     URL.revokeObjectURL(url); e.target.value = "";
-    show(r);
+    if (r) { show(r); $("status").textContent = "Photo read OK"; }
+    else $("status").textContent = `No read · ${lastStats.blobs} shapes seen · ${lastStats.segs} rows — retake with less glare`;
   };
   img.src = url;
 });
 
-// Live mode (only where the browser allows camera access, e.g. when hosted on your own HTTPS page)
+// Live mode
 $("live").addEventListener("click", async () => {
   if (liveOn) return;
+  const v = $("video");
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 } }, audio: false });
-    const v = $("video"); v.srcObject = stream; await v.play();
-    liveOn = true; $("live").textContent = "● Live: on"; $("status").textContent = "Point at the puzzle…";
-    const tick = () => {
-      if (v.videoWidth) {
-        const r = analyzeSource(v, v.videoWidth, v.videoHeight, 800);
-        // need 2 identical frames in a row before switching answer
-        if (r && r.code === pending) { if (++streak >= 2) show(r); } else { pending = r ? r.code : null; streak = r ? 1 : 0; }
-      }
-      setTimeout(tick, 30);
-    };
-    tick();
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("no camera API (open in Safari, over https)");
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    v.srcObject = stream;
+    $("stage").classList.add("live");          // video must be visible on iOS or it delivers no frames
+    await v.play();
   } catch (err) {
-    $("status").textContent = "Live camera is blocked here — use Snap photo (live needs this page hosted on your own HTTPS site).";
+    $("status").textContent = "Camera error: " + (err && (err.name + " " + err.message));
+    return;
   }
+  liveOn = true; $("live").textContent = "● Live: on";
+  let frames = 0, t0 = performance.now(), fps = 0;
+  const tick = () => {
+    if (v.readyState >= 2 && v.videoWidth) {
+      let r = null;
+      try { r = analyze(v, v.videoWidth, v.videoHeight, 800, false); }
+      catch (err) { $("status").textContent = "Scan error: " + err.message; }
+      if (r && r.code === pending) { if (++streak >= 2) show(r); }
+      else { pending = r ? r.code : null; streak = r ? 1 : 0; }
+      frames++;
+      const now = performance.now();
+      if (now - t0 > 1000) { fps = Math.round(frames * 1000 / (now - t0)); frames = 0; t0 = now; }
+      $("status").textContent = `live ${fps} fps · ${v.videoWidth}×${v.videoHeight} · ${lastStats.blobs} shapes · ${lastStats.segs} rows` + (r ? " · ✓" : "");
+    }
+    setTimeout(tick, 20);
+  };
+  tick();
 });
 </script>
 </body>
