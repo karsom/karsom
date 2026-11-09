@@ -602,13 +602,50 @@ function solveTwoStepInv(top, bottom, ops) {   // alternative convention: digit 
 function solve(rgba, w, h, manualT, order) {
   const g = toGray(rgba, w * h);
   lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
+
+  // Try the established intensity based masks first. These remain the most
+  // reliable path for ordinary monochrome puzzles and preserve manual tuning.
   if (manualT != null) {
-    for (const pol of [1, -1]) { const r = solveAt(maskGlobal(g, manualT, pol), w, h, 127); if (r) return Object.assign(r, { method: "manual", mi: -1 }); }
+    for (const pol of [1, -1]) {
+      const r = solveAt(maskGlobal(g, manualT, pol), w, h, 127);
+      if (r) return Object.assign(r, { method: "manual", mi: -1 });
+    }
     return null;
   }
+
   const L = methods(w), cache = {};
   const idx = order || L.map((_, i) => i);
-  for (const i of idx) { const r = runMethod(g, w, h, L[i], cache); if (r) return Object.assign(r, { mi: i }); }
+  for (const i of idx) {
+    const r = runMethod(g, w, h, L[i], cache);
+    if (r) return Object.assign(r, { mi: i });
+  }
+
+  // Colour independent foreground extraction. Saturation separates coloured
+  // symbols from neutral backgrounds even when their luminance is similar.
+  // Local RGB distance also handles pale or dark coloured symbols.
+  const chroma = new Uint8Array(g.length);
+  const contrast = new Uint8Array(g.length);
+  for (let i = 0, p = 0; i < g.length; i++, p += 4) {
+    const R = rgba[p], Gc = rgba[p + 1], B = rgba[p + 2];
+    const hi = Math.max(R, Gc, B), lo = Math.min(R, Gc, B);
+    chroma[i] = hi - lo;
+    contrast[i] = Math.min(255, Math.max(Math.abs(R - g[i]), Math.abs(Gc - g[i]), Math.abs(B - g[i])) * 2);
+  }
+
+  // Otsu thresholds adapt to each frame, rather than assuming a particular
+  // symbol colour or a light/dark theme.
+  const colourMethods = [
+    { data: chroma, label: "colour" },
+    { data: contrast, label: "rgb" }
+  ];
+  for (const method of colourMethods) {
+    const threshold = Math.max(12, otsu(method.data));
+    for (const pol of [1, -1]) {
+      const mask = maskGlobal(method.data, threshold, pol);
+      const r = solveAt(mask, w, h, 127);
+      if (r) return Object.assign(r, { method: method.label + (pol > 0 ? "+" : "−"), mi: -1 });
+    }
+  }
   return null;
 }
 </script>
