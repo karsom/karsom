@@ -603,8 +603,8 @@ function solve(rgba, w, h, manualT, order) {
   const g = toGray(rgba, w * h);
   lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
 
-  // Try the established intensity based masks first. These remain the most
-  // reliable path for ordinary monochrome puzzles and preserve manual tuning.
+  // Keep the established intensity masks first. They remain effective for
+  // monochrome puzzles and preserve the manual threshold control.
   if (manualT != null) {
     for (const pol of [1, -1]) {
       const r = solveAt(maskGlobal(g, manualT, pol), w, h, 127);
@@ -620,32 +620,56 @@ function solve(rgba, w, h, manualT, order) {
     if (r) return Object.assign(r, { mi: i });
   }
 
-  // Colour independent foreground extraction. Saturation separates coloured
-  // symbols from neutral backgrounds even when their luminance is similar.
-  // Local RGB distance also handles pale or dark coloured symbols.
+  // On a white or light background, any channel that falls below white is
+  // evidence of a coloured foreground. This also detects bright yellow,
+  // which can be too close to white in greyscale to segment reliably.
+  const fromWhite = new Uint8Array(g.length);
   const chroma = new Uint8Array(g.length);
-  const contrast = new Uint8Array(g.length);
   for (let i = 0, p = 0; i < g.length; i++, p += 4) {
     const R = rgba[p], Gc = rgba[p + 1], B = rgba[p + 2];
     const hi = Math.max(R, Gc, B), lo = Math.min(R, Gc, B);
+    fromWhite[i] = 255 - lo;
     chroma[i] = hi - lo;
-    contrast[i] = Math.min(255, Math.max(Math.abs(R - g[i]), Math.abs(Gc - g[i]), Math.abs(B - g[i])) * 2);
   }
 
-  // Otsu thresholds adapt to each frame, rather than assuming a particular
-  // symbol colour or a light/dark theme.
-  const colourMethods = [
-    { data: chroma, label: "colour" },
-    { data: contrast, label: "rgb" }
-  ];
-  for (const method of colourMethods) {
-    const threshold = Math.max(12, otsu(method.data));
-    for (const pol of [1, -1]) {
-      const mask = maskGlobal(method.data, threshold, pol);
-      const r = solveAt(mask, w, h, 127);
-      if (r) return Object.assign(r, { method: method.label + (pol > 0 ? "+" : "−"), mi: -1 });
-    }
+  const tryMask = (mask, method) => {
+    const r = solveAt(mask, w, h, 127);
+    return r ? Object.assign(r, { method, mi: -1 }) : null;
+  };
+
+  // Try a small set of global thresholds around Otsu's adaptive threshold.
+  // A low floor retains pale yellow and pastel colours on white backgrounds.
+  const whiteOtsu = otsu(fromWhite);
+  const whiteThresholds = [...new Set([
+    Math.max(6, Math.min(whiteOtsu, 24)),
+    8, 14, 22, 32, 48
+  ])].sort((a, b) => a - b);
+  for (const threshold of whiteThresholds) {
+    const r = tryMask(maskGlobal(fromWhite, threshold, 1), "white-rgb+" + threshold);
+    if (r) return r;
   }
+
+  // Local contrast handles glare and brightness gradients across the screen.
+  // The neighbourhood is wider than a symbol, so its pixels are compared
+  // mainly with the surrounding background rather than with themselves.
+  const whiteIntegral = integral(fromWhite, w, h);
+  for (const [fraction, offset] of [[20, 5], [12, 8]]) {
+    const radius = Math.max(8, Math.round(w / fraction));
+    const r = tryMask(maskLocal(fromWhite, w, h, whiteIntegral, radius, offset, 1),
+                      "white-local+" + radius);
+    if (r) return r;
+  }
+
+  // Saturation is independent of hue, so red, green, blue, yellow and other
+  // vivid fills share the same path. Both polarities are considered in case
+  // the coloured symbols are set against a strongly tinted background.
+  const colourThreshold = Math.max(6, Math.min(otsu(chroma), 32));
+  for (const pol of [1, -1]) {
+    const r = tryMask(maskGlobal(chroma, colourThreshold, pol),
+                      "chroma" + (pol > 0 ? "+" : "−"));
+    if (r) return r;
+  }
+
   return null;
 }
 </script>
