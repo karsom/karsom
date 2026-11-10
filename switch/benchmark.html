@@ -1,0 +1,697 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Switch Solver Simulation Benchmark</title>
+<style>
+:root{color-scheme:dark;--bg:#10131b;--panel:#1b202b;--line:#30394b;--muted:#a8b4c8;--text:#f4f7fb;--accent:#7ea7ff;--good:#35c58b;--bad:#ff7474}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,sans-serif;padding:28px 18px}
+main{max-width:980px;margin:auto}h1{font-size:25px;margin:0 0 8px}p{color:var(--muted);margin:0 0 18px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin:16px 0}
+.controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{border:0;border-radius:10px;background:var(--accent);color:#101827;font-weight:700;padding:11px 16px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
+select{background:#111722;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{background:#111722;border:1px solid var(--line);border-radius:12px;padding:13px}.metric strong{display:block;font-size:27px}.metric span{color:var(--muted);font-size:12px}
+.track{height:10px;background:#30394b;border-radius:9px;overflow:hidden;margin-top:12px}.fill{height:100%;width:0;background:var(--good);transition:width .2s}
+canvas{display:block;width:100%;max-height:300px;object-fit:contain;background:#fff;border-radius:12px;margin-top:14px}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;border-bottom:1px solid var(--line)}th{color:var(--muted);font-weight:600}
+#status{color:var(--muted);margin-top:12px}#failures{max-height:220px;overflow:auto;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;color:#ffc0c0}
+.note{font-size:13px;color:var(--muted)}@media(max-width:600px){.metrics{grid-template-columns:1fr 1fr}.panel{padding:13px}}
+</style>
+</head>
+<body>
+<main>
+<h1>Switch solver simulation benchmark</h1>
+<p>Runs the production shape solver against generated three-row puzzle layouts. No camera, network service or uploaded screenshots are used. The benchmark loads the solver directly from <code>./index.html</code>.</p>
+<section class="panel">
+<div class="controls">
+<label>Image scenarios <select id="count"><option>50</option><option selected>100</option><option>200</option></select></label>
+<button id="run">Run simulations</button>
+<button id="math">Run 500 permutation tests</button>
+</div>
+<div id="status">Loading production solver…</div>
+<canvas id="preview" width="900" height="600"></canvas>
+</section>
+<section class="panel">
+<h2>Image recognition results</h2>
+<div class="metrics">
+<div class="metric"><strong id="imagePass">—</strong><span>Correct images</span></div>
+<div class="metric"><strong id="imageRate">—</strong><span>Image accuracy</span></div>
+<div class="metric"><strong id="imageTime">—</strong><span>Average solve time</span></div>
+</div>
+<div class="track"><div class="fill" id="imageFill"></div></div>
+<p class="note">Each generated image contains a top and bottom row of coloured shapes on light grey tiles, with the hidden middle row represented by the two-step permutation calculation. Shape count varies from three to seven.</p>
+</section>
+<section class="panel">
+<h2>Two-operator logic results</h2>
+<div class="metrics">
+<div class="metric"><strong id="mathPass">—</strong><span>Correct calculations</span></div>
+<div class="metric"><strong id="mathRate">—</strong><span>Logic accuracy</span></div>
+<div class="metric"><strong id="mathTime">—</strong><span>Average calculation time</span></div>
+</div>
+<div class="track"><div class="fill" id="mathFill"></div></div>
+</section>
+<section class="panel">
+<h2>Failure log</h2>
+<div id="failures">No tests run yet.</div>
+</section>
+<p class="note">Synthetic benchmark only. It does not measure camera capture, operator OCR, live frame stability or real-world timing. Results are generated locally in this browser using the current production solver.</p>
+</main>
+<script id="core">
+// ---------- Pure detection core (no DOM) ----------
+const GLYPH = { star:"★", triangle:"▲", square:"■", plus:"✚", circle:"●", diamond:"◆", hexagon:"⬢", pentagon:"⬟" };
+const glyph = k => GLYPH[k] || k;
+
+function toGray(rgba, n) {
+  const g = new Uint8Array(n);
+  for (let i = 0, j = 0; i < n; i++, j += 4) g[i] = (rgba[j] * 77 + rgba[j + 1] * 150 + rgba[j + 2] * 29) >> 8;
+  return g;
+}
+
+function otsu(g) {
+  const hist = new Float64Array(256);
+  for (let i = 0; i < g.length; i++) hist[g[i]]++;
+  let sum = 0; for (let i = 0; i < 256; i++) sum += i * hist[i];
+  let wB = 0, sumB = 0, best = 0, t = 128;
+  for (let i = 0; i < 256; i++) {
+    wB += hist[i]; if (!wB) continue;
+    const wF = g.length - wB; if (!wF) break;
+    sumB += i * hist[i];
+    const mB = sumB / wB, mF = (sum - sumB) / wF, v = wB * wF * (mB - mF) ** 2;
+    if (v > best) { best = v; t = i; }
+  }
+  return t;
+}
+
+function hullArea(pts) {
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  const h = lo.slice(0, -1).concat(up.slice(0, -1));
+  let s = 0; for (let i = 0; i < h.length; i++) { const a = h[i], b = h[(i + 1) % h.length]; s += a[0] * b[1] - b[0] * a[1]; }
+  return Math.abs(s) / 2;
+}
+
+// Label white blobs and describe the symbol-like ones
+function blobs(g, w, h, t) {
+  const lab = new Int32Array(w * h), stack = new Int32Array(w * h);
+  const out = []; let id = 0;
+  for (let s = 0; s < w * h; s++) {
+    if (g[s] <= t || lab[s]) continue;
+    id++; let sp = 0; stack[sp++] = s; lab[s] = id;
+    let area = 0, minx = w, maxx = 0, miny = h, maxy = 0, sx = 0, sy = 0;
+    while (sp) {
+      const p = stack[--sp], x = p % w, y = (p / w) | 0;
+      area++; sx += x; sy += y;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && g[p - 1] > t && !lab[p - 1]) { lab[p - 1] = id; stack[sp++] = p - 1; }
+      if (x < w - 1 && g[p + 1] > t && !lab[p + 1]) { lab[p + 1] = id; stack[sp++] = p + 1; }
+      if (y > 0 && g[p - w] > t && !lab[p - w]) { lab[p - w] = id; stack[sp++] = p - w; }
+      if (y < h - 1 && g[p + w] > t && !lab[p + w]) { lab[p + w] = id; stack[sp++] = p + w; }
+    }
+    const bw = maxx - minx + 1, bh = maxy - miny + 1;
+    if (area < 40 || bw < 8 || bh < 8) continue;
+    if (minx === 0 || miny === 0 || maxx === w - 1 || maxy === h - 1) continue;
+    const ar = bw / bh; if (ar < 0.7 || ar > 1.45) continue;
+    const cx = Math.round(sx / area), cy = Math.round(sy / area);
+    if (lab[cy * w + cx] !== id) continue;           // hollow (tile outline / ring) -> reject
+    out.push({ id, area, minx, maxx, miny, maxy, bw, bh, cx: sx / area, cy: sy / area, size: Math.max(bw, bh) });
+  }
+  // Shape features for survivors
+  for (const b of out) {
+    const pts = [];
+    let corner = 0, cornerN = 0;
+    const kx = Math.max(1, Math.round(b.bw * 0.2)), ky = Math.max(1, Math.round(b.bh * 0.2));
+    for (let y = b.miny; y <= b.maxy; y++) {
+      let lx = -1, rx = -1;
+      for (let x = b.minx; x <= b.maxx; x++) {
+        const on = lab[y * w + x] === b.id;
+        if (on) { if (lx < 0) lx = x; rx = x; }
+        const inCx = x < b.minx + kx || x > b.maxx - kx, inCy = y < b.miny + ky || y > b.maxy - ky;
+        if (inCx && inCy) { cornerN++; if (on) corner++; }
+      }
+      if (lx >= 0) pts.push([lx, y], [rx + 1, y], [lx, y + 1], [rx + 1, y + 1]);
+    }
+    // star: two separate legs near the bottom; plus: one solid stem
+    let legs = 0;
+    for (const f of [0.84, 0.88, 0.92]) {
+      const y = Math.round(b.miny + f * (b.bh - 1)); let runs = 0, prev = false;
+      for (let x = b.minx; x <= b.maxx; x++) { const on = lab[y * w + x] === b.id; if (on && !prev) runs++; prev = on; }
+      if (runs >= 2) legs++;
+    }
+    b.legs = legs;
+    b.solidity = b.area / hullArea(pts);
+    b.extent = b.area / (b.bw * b.bh);
+    b.corner = corner / cornerN;
+    const grid = new Float32Array(G * G), tot = new Float32Array(G * G);
+    for (let y = b.miny; y <= b.maxy; y++) for (let x = b.minx; x <= b.maxx; x++) {
+      const c = Math.min(G - 1, ((y - b.miny) * G / b.bh) | 0) * G + Math.min(G - 1, ((x - b.minx) * G / b.bw) | 0);
+      tot[c]++; if (lab[y * w + x] === b.id) grid[c]++;
+    }
+    for (let i = 0; i < G * G; i++) grid[i] = tot[i] ? grid[i] / tot[i] : 0;
+    b.grid = grid;
+    b.glyph = bestClass(grid);
+  }
+  return out;
+}
+
+// ---------- Shape model: templates + user-taught examples ----------
+const G = 16;
+function tpl(fn) {
+  const t = new Float32Array(G * G);
+  for (let gy = 0; gy < G; gy++) for (let gx = 0; gx < G; gx++) {
+    let c = 0;
+    for (let sy = 0; sy < 4; sy++) for (let sx = 0; sx < 4; sx++) if (fn((gx + (sx + .5) / 4) / G, (gy + (sy + .5) / 4) / G)) c++;
+    t[gy * G + gx] = c / 16;
+  }
+  return t;
+}
+function inPoly(x, y, P) {
+  let inside = false;
+  for (let i = 0, j = P.length - 1; i < P.length; j = i++)
+    if ((P[i][1] > y) !== (P[j][1] > y) && x < (P[j][0] - P[i][0]) * (y - P[i][1]) / (P[j][1] - P[i][1]) + P[i][0]) inside = !inside;
+  return inside;
+}
+function starPoly(inner) {
+  const p = [];
+  for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? inner : 1; p.push([r * Math.cos(a), r * Math.sin(a)]); }
+  const xs = p.map(q => q[0]), ys = p.map(q => q[1]), x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  return p.map(q => [(q[0] - x0) / (x1 - x0), (q[1] - y0) / (y1 - y0)]);
+}
+const BUILTIN = {
+  square: [tpl(() => true), tpl((x, y) => !(Math.hypot(Math.max(0, Math.abs(x - .5) - .3), Math.max(0, Math.abs(y - .5) - .3)) > .2))],
+  circle: [tpl((x, y) => (x - .5) ** 2 + (y - .5) ** 2 <= .25)],
+  triangle: [tpl((x, y) => inPoly(x, y, [[.5, 0], [1, 1], [0, 1]]))],
+  diamond: [tpl((x, y) => Math.abs(x - .5) + Math.abs(y - .5) <= .5)],
+  hexagon: [tpl((x, y) => inPoly(x, y, [[.5, 0], [1, .25], [1, .75], [.5, 1], [0, .75], [0, .25]])),
+            tpl((x, y) => inPoly(x, y, [[.25, 0], [.75, 0], [1, .5], [.75, 1], [.25, 1], [0, .5]]))],
+  plus: [.26, .33, .40].map(a => tpl((x, y) => Math.abs(x - .5) <= a / 2 || Math.abs(y - .5) <= a / 2)),
+  star: [.36, .42, .5].map(r => { const P = starPoly(r); return tpl((x, y) => inPoly(x, y, P)); }),
+};
+let LEARNED = {};   // name -> [Float32Array grid], filled by the UI from localStorage
+function iou(a, b) { let mn = 0, mx = 0; for (let i = 0; i < a.length; i++) { mn += Math.min(a[i], b[i]); mx += Math.max(a[i], b[i]); } return mx ? mn / mx : 0; }
+function classList() { return [...new Set(Object.keys(BUILTIN).concat(Object.keys(LEARNED)))]; }
+function classScore(grid, k) {
+  let best = 0;
+  for (const t of BUILTIN[k] || []) best = Math.max(best, iou(grid, t));
+  for (const t of LEARNED[k] || []) best = Math.max(best, iou(grid, t) + 0.03);   // taught examples get a small edge
+  return best;
+}
+function bestClass(grid) { let bk = null, bs = -1; for (const k of classList()) { const v = classScore(grid, k); if (v > bs) { bs = v; bk = k; } } return bk; }
+
+function* combos(n, k, start = 0, acc = []) {
+  if (acc.length === k) { yield acc.slice(); return; }
+  for (let i = start; i < n; i++) { acc.push(i); yield* combos(n, k, i + 1, acc); acc.pop(); }
+}
+function bestPerm(S, set) {               // assign each blob in a row a distinct class from `set`
+  const n = set.length, used = new Array(n).fill(false), cur = []; let best = { s: -1 };
+  (function rec(i, sum) {
+    if (i === n) { if (sum > best.s) best = { s: sum, perm: cur.slice() }; return; }
+    for (let j = 0; j < n; j++) if (!used[j]) { used[j] = true; cur.push(set[j]); rec(i + 1, sum + S[i][set[j]]); cur.pop(); used[j] = false; }
+  })(0, 0);
+  return best;
+}
+// Joint read of two rows: both must be permutations of the same set of distinct shapes.
+function assignRows(A, B) {
+  const K = classList(), n = A.length;
+  if (n > K.length || n > 8) return null;
+  const SA = A.map(b => K.map(k => classScore(b.grid, k))), SB = B.map(b => K.map(k => classScore(b.grid, k)));
+  const opts = [];
+  for (const c of combos(K.length, n)) {
+    const pa = bestPerm(SA, c), pb = bestPerm(SB, c);
+    opts.push({ tot: pa.s + pb.s, pa: pa.perm, pb: pb.perm });
+  }
+  opts.sort((x, y) => y.tot - x.tot);
+  const best = opts[0];
+  const top = best.pa.map(i => K[i]), bottom = best.pb.map(i => K[i]);
+  const each = best.pa.map((k, i) => SA[i][k]).concat(best.pb.map((k, i) => SB[i][k]));
+  if (Math.min(...each) < 0.45) return null;                     // something doesn't look like any known shape
+  const code = bottom.map(x => top.indexOf(x) + 1).join("");
+  const rival = opts.find(o => o.pb.map(i => K[i]).map(x => o.pa.map(i => K[i]).indexOf(x) + 1).join("") !== code);
+  const margin = rival ? (best.tot - rival.tot) / (2 * n) : 1;
+  if (margin < 0.015) return null;                                 // too close to call
+  return { top, bottom, mean: best.tot / (2 * n), margin, code };
+}
+
+// Find horizontal runs of similar-sized blobs ("segments"), then a pair of
+// segments one above the other that hold the same distinct symbols.
+function segments(bs) {
+  const segs = [], used = new Set();
+  const sorted = [...bs].sort((a, b) => a.cx - b.cx);
+  for (const start of sorted) {
+    if (used.has(start)) continue;
+    const seg = [start]; let cur = start;
+    while (true) {
+      let next = null;
+      for (const b of sorted) {
+        if (b.cx <= cur.cx || seg.includes(b)) continue;
+        const r = b.size / cur.size, dx = b.cx - cur.cx;
+        if (r < 0.65 || r > 1.55) continue;
+        if (Math.abs(b.cy - cur.cy) > 0.45 * cur.size) continue;
+        if (dx < 1.1 * cur.size || dx > 4.5 * cur.size) continue;
+        if (!next || b.cx < next.cx) next = b;
+      }
+      if (!next) break;
+      seg.push(next); cur = next;
+    }
+    if (seg.length >= 3 && seg.length <= 8) { seg.forEach(b => used.add(b)); segs.push(seg); }
+  }
+  return segs;
+}
+
+let lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
+function solveAt(g, w, h, t) {
+  const bs = blobs(g, w, h, t), segs = segments(bs);
+  if (bs.length >= lastStats.blobs) lastStats = { blobs: bs.length, segs: segs.length, t, list: bs, mask: g };
+  const mean = (seg, k) => seg.reduce((s, b) => s + b[k], 0) / seg.length;
+  let best = null;
+  for (const A of segs) for (const B of segs) {
+    if (A === B || A.length !== B.length) continue;
+    const sz = (mean(A, "size") + mean(B, "size")) / 2, dy = mean(B, "cy") - mean(A, "cy");
+    if (dy < 1.2 * sz || dy > 13 * sz) continue;                     // B is the row below A
+    const r = mean(A, "size") / mean(B, "size"); if (r < 0.65 || r > 1.55) continue;
+    if (Math.abs(mean(A, "cx") - mean(B, "cx")) > 2 * sz) continue; // stacked, not side by side
+    const J = assignRows(A, B); if (!J) continue;
+    const score = A.length * 1000 + J.mean * 100 - dy / sz;
+    if (!best || score > best.score) {
+      A.forEach((b, i) => b.glyph = J.top[i]); B.forEach((b, i) => b.glyph = J.bottom[i]);
+      best = {
+        score, threshold: t, top: J.top, bottom: J.bottom, blobs: A.concat(B), rowA: A, rowB: B, conf: J.mean, margin: J.margin,
+        code: J.code, inverse: J.top.map(x => J.bottom.indexOf(x) + 1).join("")
+      };
+    }
+  }
+  return best;
+}
+
+// ---- Binarisation methods: both polarities (dark & light mode), global + local ----
+function integral(g, w, h) {
+  const I = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    let row = 0;
+    for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; }
+  }
+  return I;
+}
+function maskGlobal(g, t, pol) {
+  const m = new Uint8Array(g.length);
+  if (pol > 0) for (let i = 0; i < g.length; i++) m[i] = g[i] > t ? 255 : 0;
+  else for (let i = 0; i < g.length; i++) m[i] = g[i] < t ? 255 : 0;
+  return m;
+}
+function maskLocal(g, w, h, I, r, c, pol) {
+  const m = new Uint8Array(g.length), W = w + 1;
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      const mean = (I[y1 * W + x1] - I[y0 * W + x1] - I[y1 * W + x0] + I[y0 * W + x0]) / ((y1 - y0) * (x1 - x0));
+      const v = g[y * w + x];
+      m[y * w + x] = (pol > 0 ? v > mean + c : v < mean - c) ? 255 : 0;
+    }
+  }
+  return m;
+}
+function methods(w) {
+  const L = [];
+  for (const pol of [1, -1]) {
+    L.push({ k: "otsu", pol });
+    L.push({ k: "local", pol, r: Math.round(w / 20), c: 14 });
+    L.push({ k: "local", pol, r: Math.round(w / 10), c: 14 });
+    L.push({ k: "local", pol, r: Math.round(w / 20), c: 28 });
+  }
+  for (const t of [150, 185, 215, 240, 120, 90]) L.push({ k: "glob", pol: 1, t });
+  for (const t of [100, 70, 130, 40, 160]) L.push({ k: "glob", pol: -1, t });
+  return L;
+}
+function runMethod(g, w, h, M, cache) {
+  let m;
+  if (M.k === "glob") m = maskGlobal(g, M.t, M.pol);
+  else if (M.k === "otsu") { cache.o ??= otsu(g); m = maskGlobal(g, cache.o, M.pol); }
+  else { cache.I ??= integral(g, w, h); m = maskLocal(g, w, h, cache.I, M.r, M.c, M.pol); }
+  const r = solveAt(m, w, h, 127);
+  if (r) r.method = M.k + (M.pol > 0 ? "+" : "−") + (M.t ?? M.r ?? "");
+  return r;
+}
+
+
+// ---------- Two-operator levels ----------
+// Convention (verified on real levels): code[i] = which input position lands at output position i.
+const applyOp = (op, row) => op.map(d => row[d - 1]);
+const derive = (from, to) => to.map(x => from.indexOf(x) + 1).join("");
+const isPerm = (str, n) => str.length === n && [...str].map(Number).sort().join("") === Array.from({ length: n }, (_, i) => i + 1).join("");
+// Band between the two symbol rows that holds the operator chips (in work-canvas pixels)
+function opBand(r, w, h) {
+  const A = r.rowA, B = r.rowB, s = A.reduce((m, b) => m + b.size, 0) / A.length;
+  const all = A.concat(B);
+  const x0 = Math.max(0, Math.min(...all.map(b => b.minx)) - s), x1 = Math.min(w, Math.max(...all.map(b => b.maxx)) + s);
+  const y0 = Math.max(...A.map(b => b.maxy)) + 0.6 * s, y1 = Math.min(...B.map(b => b.miny)) - 0.6 * s;
+  return { x: Math.round(x0), y: Math.round(y0), w: Math.round(x1 - x0), h: Math.round(y1 - y0), s };
+}
+const rowGeom = r => {
+  const avg = (L, k) => L.reduce((m, b) => m + b[k], 0) / L.length, A = r.rowA, B = r.rowB;
+  const pitch = (A[A.length - 1].cx - A[0].cx + B[B.length - 1].cx - B[0].cx) / (2 * (A.length - 1));
+  return { pitch, yA: avg(A, "cy"), yB: avg(B, "cy"), xA: avg(A, "cx"), xB: avg(B, "cx") };
+};
+// single-operator levels: rows ~1.4 tile-pitches apart; two-operator (hidden middle row): ~2.8
+const isTwoStep = r => { const g = rowGeom(r); return (g.yB - g.yA) / g.pitch > 2.1; };
+// words: [{text, y}] with y relative to band. Returns {first, second} operator strings (or null)
+function parseOps(words, bandH, n) {
+  const out = { first: null, second: null };
+  for (const wd of words) {
+    const d = (wd.text.match(/\d+/g) || []).join("");
+    let op = null;
+    if (isPerm(d, n)) op = d;
+    else if (d.length === n + 1 && isPerm(d.slice(1), n)) op = d.slice(1);   // arrow read as a digit
+    if (!op) continue;
+    if (wd.y < bandH / 2) out.first ??= op; else out.second ??= op;
+  }
+  return out;
+}
+function solveTwoStep(top, bottom, ops) {
+  if (ops.first && !ops.second) return { code: derive(applyOp(ops.first.split("").map(Number), top), bottom), hidden: "second" };
+  if (ops.second && !ops.first) {
+    const op = ops.second.split("").map(Number), mid = [];
+    op.forEach((d, i) => mid[d - 1] = bottom[i]);
+    return { code: derive(top, mid), hidden: "first" };
+  }
+  return null;
+}
+
+
+// ---------- Operator-chip OCR (digits) ----------
+function bandGray(rgba, W, b, K) {
+  const w = Math.round(b.w * K), h = Math.round(b.h * K), g = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const i = ((b.y + ((y / K) | 0)) * W + b.x + ((x / K) | 0)) * 4;
+    g[y * w + x] = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+  }
+  return { g, w, h };
+}
+// Make text black on white whatever its colour: pixels that differ strongly from their surroundings become ink
+function binarizeText(g, w, h, R, C) {
+  const I = integral(g, w, h), out = new Uint8Array(w * h), W1 = w + 1;
+  let brightInk = 0, darkInk = 0;
+  const mean = new Float32Array(w * h);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1), y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+    const m = (I[y1 * W1 + x1] - I[y0 * W1 + x1] - I[y1 * W1 + x0] + I[y0 * W1 + x0]) / ((x1 - x0) * (y1 - y0));
+    mean[y * w + x] = m; const v = g[y * w + x];
+    if (v > m + C) brightInk++; else if (v < m - C) darkInk++;
+  }
+  const bright = brightInk >= darkInk;     // light text (dark mode) or dark text (light mode)
+  for (let i = 0; i < w * h; i++) out[i] = (bright ? g[i] > mean[i] + C : g[i] < mean[i] - C) ? 0 : 255;
+  return out;
+}
+// The two operator chips sit 1/4 and 3/4 of the way from the top row to the bottom row.
+function chipRects(r, W, H) {
+  const { pitch, yA, yB, xA, xB } = rowGeom(r), s = 0.36 * pitch;   // s ~ symbol size
+  return [0.25, 0.75].map(t => {
+    const cy = yA + t * (yB - yA), cx = xA + t * (xB - xA);
+    const x0 = Math.max(0, cx - 1.9 * s), x1 = Math.min(W, cx + 2.8 * s), y0 = Math.max(0, cy - 0.8 * s), y1 = Math.min(H, cy + 0.8 * s);
+    return { x: Math.round(x0), y: Math.round(y0), w: Math.max(1, Math.round(x1 - x0)), h: Math.max(1, Math.round(y1 - y0)), s };
+  });
+}
+// Digit templates rendered from 7 common bold UI fonts (16x16, bbox-normalised)
+const DIGIT_SRC = {"0":["00017bdffdb61000004effffffffe40004ffffd99dffff400dfffa0000afffd06fffd100001efff5afff70000009fffadfff40000006fffcefff20000005fffeefff20000005fffedfff40000006fffcafff80000009fffa5fffe100001efff50dfffb1001bfffd003ffffebbeffff30004dffffffffd40000005adffda50000","00016bdffeb71000004effffffffe50004ffff9558efff501effe300002efff27fff70000006fff8bfff20000001fffcdffe00000000cffffffc00000000bffffffc00000000bfffdffe00000000cfffbfff20000001fffc6fff80000006fff81effe400003effe204ffffa669ffff50004dffffffffe50000005adffdb60000","00017bdffeb71000003dffffffffe40003efffffefffff400dfffe5004efffe15ffff600004ffff6afffe000000dfffbcfffb000000afffeefffa0000009ffffefffa0000009ffffcfffb000000afffe9fffe100000dfffb5ffff600005ffff60cffff7226efffd102efffffffffff40003cffffffffd40000005adffeb60000","00017beffeb71000005effffffffe40005fffffccfffff401efffe2003efffd07ffff600008ffff6cffff200004ffffaeffff000002ffffdffffe000001ffffeffffe000001ffffeeffff000002ffffdcffff200004ffffa7ffff600007ffff61efffd1002efffd005ffffeaaeffff40005effffffffe40000017beffeb71000","00049ceffec8300000affffffffff9000affffa66bffff803ffff70000affff29fffe100003ffff7dfffb000000efffbffff9000000cfffdffff8000000bfffeffff8000000bfffeffff9000000cfffddfffb000000efffb9ffff100003ffff73ffff90000bfffe209ffffc99dffff70009ffffffffff80000028ceffeb71000","00017beffeb71000006effffffffe60006ffffffffffff602effffb88bffffe27ffff800008ffff7bffff200002ffffbefffe000000efffeffffc000000dffffffffc000000dffffefffd000000efffebffff100001ffffb7ffff800008ffff72effffb88bffffe206ffffffffffff60006effffffffe60000027beffeb71000","00038ceffeb7200001affffffffff9000bffffa77bffff904ffff700009ffff2afffe000002ffff8dfffa000000dfffbffff8000000cfffdffff8000000bfffeffff8000000bfffeffff9000000cfffddfffb000000dfffbafffe100002ffff74ffff80000affff20bffffc9adffff8001affffffffff80000038ceffeb71000"],"1":["0000038dfffffffd0159dffffffffffdafffffffeffffffdeffffb627ffffffdefb620007ffffffd510000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd000000007ffffffd","0000015bffffffff0037bfffffffffff9efffffe9effffffdfffea510dffffffdd8400000dffffff200000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff000000000dffffff","000005aefffffffd016aeffffffffffdbffffffffffffffdeffffea8fffffffdeffa5104fffffffd95100004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd00000004fffffffd","368bdfffffe00000ffffffffffe00000ffffffffffe0000097520bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe0000000000bffffe00000bddddefffffddddddfffffffffffffffdfffffffffffffff","00000000004fffff0000000039ffffff2234579dffffffffffffffffffffffffddddddddefffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff","ffffffffffffffffffffffffffffffffffffffffffffffff88888affffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff000005ffffffffff","00000000004fffff0000000039ffffff2234579dffffffffffffffffffffffffffffffffffffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff000000005fffffff"],"2":["00049ceffdb8300003cffffffffffa103effffb9adffffc1bfffd200006ffff7ffff6000000cfffa11110000000dfff800000000008fffe2000000001affff4000000003dffff5000000017ffffc300000004dffff7000000019ffffb200000004dffff7000000008fffffdaaaaaaaaadfffffffffffffffdfffffffffffffff","00049ceffeb8200003cffffffffffa103efffc6558efffd1bfff7000001cfff7eeee00000006fffa000000000008fff800000000004effe20000000006fffe3000000001afffd3000000005dfffa100000001afffe5000000005efffa100000001afffe5000000004effff7555555555efffffffffffffffefffffffffffffff","00038ceffeb8300002bffffffffffb201dffffffffffffd19ffffa2003cffff8efffe100003ffffc33333000003ffffa0000000000affff4000000002cffff8000000005effff800000002bffffe500000006effffb10000002bffffe600000007fffffb211111119fffffffffffffffafffffffffffffffafffffffffffffff","258acefffdb84000fffffffffffffc30fffffedeffffffe3fc7310003cfffffb3000000001fffffe0000000000effffc0000000005fffff6000000005effff800000002bfffff600000006effffc30000003bffffe600000019fffffb20000005dffffc400000000ffffffffffffffffffffffffffffffffffffffffffffffff","00038ceffec9400002bffffffffffd501dffffa779effff47ffff500003efffcafffd000000affff79997000000affff00000000002efffb0000000003dfffe200000002affffd30000003affffd60000002bffffd500000007efffd500000000affffa1000000006fffffcbbbbbbbbbcfffffffffffffffffffffffffffffff","00038beffec9500002affffffffffc301dffffffffffffe29ffffe5238fffff9effff60000dffffc8888820000dffffb0000000004fffff7000000003effffd100000004effffe300000018fffffc20000004dfffff90000003bfffffc40000019fffffe60000000efffffffffffffffffffffffffffffffffffffffffffffff","00038ceffec9400002bffffffffffd401dffffb87afffff47ffff600003ffffcafffd000000affff8bbb9000000affff00000000002efffb0000000003dfffe3000000029ffffc30000003affffd50000002bffffd600000008ffffd600000000affffa1000000006fffffcbbbbbbbbbcfffffffffffffffffffffffffffffff"],"3":["00049ceffeb8200001bffffffffff8001dfffea88bffff807fffd100007fffe157774000002ffff200000000006fffd0000003667bfffd30000007fffffc5000000007ffffffea300000000014bffff400000000000cfffc99993000000afffecfffc200005ffffb4fffffdbbeffffe204cffffffffffb3000049ceffeb83000","00038ceffec8200001affffffffff9000bfffc6447dfff804fff9000001dffe026661000000afff100000000001effc00000014458effd30000005fffffc5000000004ddefffea3000000000017effe3000000000005fffb677600000002fffebfff60000009fffb2efffc8668dfffe203cffffffffffc3000049ceffec83000","00039ceffeb8200001bffffffffff7001dfffffddfffff806ffff91003effff16aaa9000008ffff30000000001cfffe1000004889dfffd30000008fffffc6000000008fffffffb300000011237effff500000000004ffffcccccb000003ffffebffffa3125dffffa3effffffffffffe303cffffffffffb2000039ceffeb83000","17acdefffec961003ffffffffffffe403ffecbbcffffffe1262000001afffff50000000001fffff50000000006ffffd000038889cffffb300007fffffffe81000007ffffffffff70000000024afffff50000000000bffffc0000000000affffd9410000005fffffafffcaaabdfffffe3fffffffffffffc3069bdefffedb84000","0016adeffec8400005effffffffffb103ffffc767bffffb09fffd10000bffff2bfff8000008ffff20000000001dfffb0000000568dfff910000000dfffffa3000000008abeffff9000000000019ffff700000000000dfffddddd6000000cfffdcfffd200006ffffa4fffffb99dffffe204dffffffffffb200005aceffeb83000","00059ceffeca500002cffffffffffd302effffffffffffe28fffff5117fffff88bbbb70000dffff90000000003effff50000029acfffff80000004ffffffb200000004fffffffd400000014459effff511111000006ffffdeffff500004fffffbffffe5104dffffd3efffffffffffff503dffffffffffe5000059ceffeda6100","0005aceffdb7200004dffffffffffa102efffe978dffffa08fffe10000cffff1bfff8000008ffff22222100000cfffc0000000457dfffb10000000dfffffa2000000009bdfffff9000000000019ffff700000000000dfffdffff7000000dfffdcfffe300008ffff94fffffc9adffffe204dffffffffffb2000059ceffdb83000"],"4":["00000002effff7000000001dfffff700000000bffffff700000007fffdfff70000003fffc5fff7000002dffc15fff700000cffe205fff700009fff5005fff70007fff90005fff7004fffc00005fff700efffa9999bfffc99ffffffffffffffffffffffffffffffff2222222227fff9220000000006fff7000000000006fff700","00000000affff40000000008fffff4000000005ffffff400000002effafff40000000cffb2fff4000000bffc12fff4000009ffe102fff400005fff4002fff40002eff80002fff4002dff900002fff400cffe766668fff966effffffffffffffeeffffffffffffffe0000000003fff5000000000003fff4000000000003fff400","00000007fffffa000000003efffffa00000001dffffffa0000000afffffffa0000006fffcbfffa000004fffe2afffa00002efff50afffa0000bfffa00afffa0008fffd100afffa005fffe3000afffa00efffdbbbbefffdbaefffffffffffffffefffffffffffffff555555555dfffb55000000000cfffa00000000000cfffa00","0000000afffff3000000006ffffff300000004fffffff30000002effdffff3000001cffa8ffff300000bffd18ffff300008ffe308ffff30005fff4008ffff3003fff70008ffff300dffa00008ffff300fffdddddeffffdddffffffffffffffffffffffffffffffff000000008ffff300000000008ffff300000000008ffff300","00000003effff8000000002dfffff800000001cffffff80000000aff9efff80000009ffa0efff8000007ffc10efff800004ffd200efff80002efe3000efff8001dff50000efff800bff922222efff922fffffffffffffffefffffffffffffffe444444444efffa44000000000efff800000000000efff800000000000efff800","00000001dffffd000000000bfffffd000000009ffffffd00000006fffffffd0000004ffffbfffd000004ffff68fffd00002efff908fffd0001dfffb008fffd000afffe1008fffd008ffff63339fffd33ffffffffffffffffffffffffffffffffffffffffffffffff222222222ffffd22000000000ffffd00000000000ffffd00","00000003effff8000000002dfffff800000001cffffff80000000affaefff80000008ffb0efff8000005ffd10efff800003ffe200efff80003efe3000efff8002dff40000efff800cff933333efffa33fffffffffffffffefffffffffffffffe666666666ffffb66000000000efff800000000000efff800000000000efff800"],"5":["08ffffffffffffb00affffffffffffb00bfffbaaaaaaaa800dfff100000000000fffe000000000002fffc048aa9610004fffcdffffffe9106fffffdbceffffc0268aa300018ffff7000000000009fffd000000000006ffff9aaa50000008fffdafffd200005ffff72effffb99cffffc003cffffffffff91000038ceffdb71000","07ffffffffffffa009ffffffffffffa00bffd555555555400effa000000000001fff8000000000003fff6158987300005fffbeffffffc5007ffffda9adffff9024684000005efff5000000000006fffb000000000002fffd888700000004fffccfff6000001cfff63ffffb6458efffb003cfffffffffe80000049ceffdb61000","0affffffffffffc00cffffffffffffc00effffffffffffc01ffff711111111102ffff500000000003ffff327aba720005ffff9fffffffa107fffffffffffffd14acefa3004dffff800001000002efffd00000000000cffffbcccb000001efffdaffffb2003cffff72efffffeefffffc102bffffffffff91000038ceffdb72000","3fffffffffffff703fffffffffffff703fffffffffffff703ffff300000000003ffff300000000003ffffbcddca720003ffffffffffffa103ffffedeffffffc12a6200003bfffff80000000000cffffd00000000008fffff0000000000affffed941000018fffff8efffdbbcffffffc1effffffffffff910269bdeffeda61000","006ffffffffffff100affffffffffff100dffdbbbbbbbbb102fff4000000000005fff1000000000009ffd5aeffda50000cfffffffffffc201ffffd877bffffd129998100005ffff800000000000bfffd000000000008fffe78884000000bfffcbfffd100007ffff64ffffea99dffffb004dfffffffffe8100005adeffdb71000","cfffffffffffffa0cfffffffffffffa0cfffffffffffffa0cffff44444444430cffff00000000000cffff17acdc94000cffffefffffffc20cfffffffffffffd2cffffe6335dffff967777300003ffffd00000000000fffffbbbbb400004ffffdbffffe8447effff83effffffffffffd103cffffffffffb2000049ceffec93000","006ffffffffffff1009ffffffffffff100dffeddddddddd101fff5000000000005fff1000000000008ffd5adeeda50000cfffffffffffc200ffffea99cffffd12cccb200006ffff800000000000bfffd000000000008fffe9aaa5000000bfffcbfffd300018ffff63effffdbceffffb003dffffffffff8000005adeffdb72000"],"6":["000049defec93000001cfffffffffa1001dffffcbcffffc10bfffc20003efff74fffe100000577759fff800367640000cfff46dfffffe700efffaffedfffffb0effffc30017ffff7dfffe1000008fffcbfffa0000004fffe7fffd0000007fffc1efff800003efff804ffffea9bffffc1004dfffffffff91000005adffec82000","000049cefed94000001bfffffffffc2002dfffb767cfffd10afff5000008fff83fff7000000166658fff100466520000cffc18efffffc600effcdffcbdffffa0fffff810003cfff6efff80000002fffdbfff30000000cfff7fff50000000effe1effd3000009fff905ffff9557cfffd1004dfffffffffa2000005adffec82000","000049defec93000001afffffffffb1002dfffffffffffc10bffffa313bffff83ffff9000009aaa89ffff20257751000cfffd2afffffe920dfffddffffffffd1efffff9324bffff9dffff800000dfffeaffff4000009ffff6ffff600000bfffe1dfffe50018ffff904ffffffefffffd1003cfffffffffa2000004adffec83000","000027bdfffdc9500008ffffffffffa001cffffebaabefa00bffff91000003404ffff90000000000affff21566520000dffffbffffffc600ffffffffffffffb0ffffff7103dffff7effffb00004ffffccffff800001ffffe7ffff900002ffffd1efffe10007ffff805ffffd88affffd1004efffffffffb2000016bdffec94000","00016adeffda7100004efffffffffe4004ffffb767dfffe21efff900001abbb66ffff20000000000afffc01466520000dfffb9efffffd710effffffedfffffc1fffffb20018ffff8efffd000000afffecfff90000007ffff8fffb0000009fffd2ffff700005ffff808ffffd99cffffd1007efffffffffa1000017bdffec82000","00038ceffec93000009ffffffffff90008fffffdefffff802ffffb1004fffff17ffff20000577772bfffc00144310000efffa6dfffffc600ffffefffffffff90ffffffdaacfffff7effff700008ffffdbffff100001fffff7ffff300003ffffe1efffd6446dffff907ffffffffffffe1008ffffffffffc2000027bdffec94000","000049cefeda5000003cfffffffffd4003efffd878efffe20cfffa00002cddd65ffff20000000000afffd01466520000dfffb8efffffd700efffffffffffffb1fffffc30029ffff8efffd100000bfffddfff90000007ffffafffb0000009fffd4ffff700005ffff80affffda9cffffd1009ffffffffffb2000027bdffec83000"],"7":["ffffffffffffffffffffffffffffffffaaaaaaaaaaafffff00000000007ffff70000000003ffffb0000000001dfffe2000000000affff40000000005ffff80000000001dfffc0000000000afffe20000000006ffff50000000003ffff90000000000cfffd10000000009fffe30000000006ffff70000000002efffd000000000","effffffffffffffeeffffffffffffffe55555555555bfffc00000000003efff30000000000cfff700000000009fffb00000000005fffd10000000002efff40000000000cfff800000000008fffb00000000005fffe20000000001efff50000000000bfff900000000007fffc10000000004fffe20000000001dfff6000000000","ffffffffffffffffffffffffffffffffffffffffffffffff1111111111cffffa0000000006ffffd1000000002effff4000000000cffff80000000008ffffd1000000004fffff4000000001effff7000000000affffb0000000004ffffe1000000001effff6000000000bffffb0000000008ffffd1000000003fffff400000000","fffffffffffffffefffffffffffffffefffffffffffffffb0000000003fffff3000000000cffff80000000006ffffe1000000001effff50000000009ffffb0000000004fffff2000000000cffff80000000005ffffd1000000001effff50000000009ffffb0000000003fffff2000000000cffff80000000006ffffd10000000","ffffffffffffffffffffffffffffffffdddddddddddefffe00000000006fffc20000000007fffc10000000008fffc10000000007fffd20000000004ffff40000000001dfff800000000008fffd10000000001efff700000000007fffe10000000000dfff800000000003ffff300000000006fffe00000000000afffc00000000","ffffffffffffffffffffffffffffffffffffffffffffffff4444444444effff90000000008ffffe1000000003fffff6000000001dffffa0000000009ffffd1000000003fffff5000000001dffffb0000000008fffff2000000003fffff7000000000cffffd0000000006fffff4000000002effff9000000000ceeeec00000000","ffffffffffffffffffffffffffffffffdddddddddddefffe00000000005fffd20000000006fffd10000000006fffd10000000006fffe20000000004ffff40000000001efff700000000009fffd00000000002ffff600000000008fffe00000000000efff800000000003ffff300000000007fffe00000000000afffc00000000"],"8":["00038ceffec83000009ffffffffff9000affffa77affffa02ffff500005ffff33ffff000000ffff30dfff500005fffd002cfff9669fffd200006effffffd600002affffffffffa203efffa2002afffe3bfffa000000bfffbefff70000008fffecfffd100001dfffc4ffffe9669effff403cffffffffffc4000049ceffec83000","00038ceffec83000019ffffffffffa1009fffc6335cfffa01fffc000000cfff21fff90000009fff20cffd100001dffd003dffd7447dffd300006effffffd610002affffddffffa202effe610016effe3bfff30000004fffceffe00000001ffffcfff50000006fffd4ffffa5335affff404cffffffffffd4000049ceffec94000","00038beffec8300001affffffffffa100affffebbeffffb02ffffd1001cffff33ffff700007ffff30dfffb0000bfffd003dfffc88cfffd300007effffffd610003bffffffffffb303efffe6226efffe3bffff400004ffffbeffff200001ffffebffff910009ffffc3fffffebbefffff403cffffffffffc4000048ceffec83000","0027bdeffedb720006efffffffffff604fffffc88bfffff48ffffb0000affff98ffff700007ffff94ffffc0000bffff405efffdaadfffe60001affffffffa10007effffddffffe707ffffb2001affff8effff200002ffffefffff100001fffffdffff700006ffffe7fffffb88bfffff808ffffffffffff800027bdeffedb7200","00049ceffec8300001bffffffffffa100cfffd8668efffb04fffd100001dfff24fffa000000afff31dffe400004effc002afffcaacfff910005dffffffffc4001bfffe8669efffa1afffd100002efff9ffff70000008fffeffff70000008fffecfffe300004efffb3fffffb99cffffe203cffffffffffb2000049ceffec83000","0005aceffeca500002dffffffffffd200dfffffeefffffd05ffffd3002dffff55ffff800008ffff51efffb0000bfffe105efffd99dfffe40006fffffffffe5000afffffdefffffa08ffff91002bffff8efffd000001ffffeefffe100002ffffebffffb3014cffffb2effffffffffffe203cffffffffffc3000049ceffec94000","00027beffeb7200001affffffffff9100bfffea77aefffa03fffe200002efff24fffa000000afff31effe200003effd003dfffa77afffd30003dffffffffc2001affffb99cffff809fffe300004efff8ffff70000009fffeffff70000008ffffdfffe300004efffb4fffffc99cfffff304dffffffffffc3000049ceffec94000"],"9":["00049ceffda6100001bfffffffffe4001dffffa89dffff408fffd200008fffe1dfff5000000dfff7efff2000000bfffbcfff8000002efffd7ffff81004dffffe0afffffdeffafffd006efffffd56fffc000046663009fff969995000001efff36fffe50003cfffa00bffffecdffffc10019fffffffff910000028cefec920000","00049ceffdb6100001bfffffffffe5001cfffc6458efff608fff7000001dffe1dffd00000005fff8fffb00000004fffdcffe20000009ffff5fffd400019fffff08ffffdccffbdfff004cfffffe81dffd000024553002fff9577700000008fff36fff9000006fffb00cfffd878cfffd2001afffffffffa20000039cefec930000","00038ceffdb6100001afffffffffe5001cfffffddfffff608ffffa1003dffff2cfffd000004ffff8efffb000001ffffdcfffe200007fffff7ffffd6338ffffff0bffffffffecffff007efffffb2bfffe00004665201efffa7cccc200008ffff55ffffd5349ffffc00afffffffffffe20008effffffffa20000017cefed930000","00049ceffdb6100002bfffffffffe4001dffffa89dffff508ffff70001dfffe1dffff200009ffff7effff100008ffffccffff50000bffffe7ffffe745affffff0bffffffffffffff006cffffffaffffd00002566412ffffa0000000000affff40430000019ffffb00afebaacfffffc100affffffffff8000059cefffdb720000","00049ceffeb7100001bfffffffffe5001dfffd866affff608fffd100005fffe1cfff7000000cfff7dfff6000000afffbbfffa000001efffd5ffff81003cffffe09fffffdeffffffd006effffffbafffb00004677630bfff800000000001efff47fffe20001afffc02efffea9aefffe2003cfffffffffc3000005adffeda40000","00059cefedb8300002cffffffffff9002effffffffffff80affffe6336effff2effff300003ffff8fffff100001ffffccffff910008ffffe5fffffecceffffff07ffffffffffffff004aeffffc69fffe00000122000afffb39999600001efff82fffff5001affff208fffffedfffff80008ffffffffffa0000038ceffec94000","00038ceffeb7100002bfffffffffe7001dfffe978bffff708fffd200006ffff2cfff7000000cfff7dfff6000000afffbbfffa000001efffd5ffff93125cffffd09fffffffffffffd007effffffaafffb00004788730bfff812221000001efff47fffe20001bfffb01efffeb9aefffe2003cfffffffffc30000049defeda40000"],"?":["00049ceffec9500005dffffffffffd605fffffc99dfffff6cffff400007ffffd77775000001ffffe0000000001bffffa000000018effffc10000008effffc600000007ffffc4000000000cfffc00000000000dfff80000000000000000000000000003786100000000005ffffd10000000007fffff200000000019efd5000000","00049ceffec9510005dffffffffffe705ffffd7447dffff8cfffb000000bfffe555520000009ffff00000000004efffb000000004bffffc20000004dffffc600000002efffb30000000007fffb00000000000afff60000000000000000000000000000353000000000002dfffb00000000005fffff100000000008dfd6000000","0016adeffeda720005efffffffffff805ffffffddffffff8cffffa1002dffffe88888200009fffff0000000004effffb00000006cfffffd2000001cfffffe81000000affffe6100000000fffff30000000001ddddc0000000000000000000000000018ccb700000000009fffff60000000009fffff700000000019efd8000000","58acdefffeca6100ffffffffffffff80ffffdbbcfffffff9e95100001affffff0000000004ffffff000000003dfffff900000019ffffffb0000007efffffd6000000afffffe700000004ffffff5000000004bbbbbb10000000000000000000000005dddddd1000000005ffffff1000000005ffffff1000000005ffffff100000","00049ceffec8300002cffffffffffb201dffffc99cffffe28ffff500005efffacfff90000009fffe999940000009fffe00000000005ffff9000000003affffb100000009ffffe6000000008ffff81000000001ffff400000000002bbbb0000000000012222100000000007ffff800000000007ffff800000000007ffff800000","0015adeffeda610005effffffffffe504ffffffffffffff6cffffd4116fffffd9aaaa40000cfffff0000000003effffd00068889cffffff6000cfffffffffc50000cffffecb84000000cffff60000000000566663000000000000000000000000005cfeb30000000005fffffe1000000006ffffff20000000007dffc50000000","00059ceffeb8300003dffffffffffb302effffd99dffffe3affff600006ffffbefff9000000bffffaaaa3000000bffff00000000007ffffa000000004cffffb100000009ffffd6000000008fffe60000000000efff200000000001aaa90000000000013333100000000006ffff600000000006ffff600000000006ffff600000"]};
+const DIGITS = Object.fromEntries(Object.entries(DIGIT_SRC).map(([ch, L]) => [ch, L.map(hex => Float32Array.from(hex, c => parseInt(c, 16) / 15))]));
+function bandGrayBilinear(rgba, W, H, b, K) {
+  const w = Math.round(b.w * K), h = Math.round(b.h * K), g = new Uint8Array(w * h);
+  const lum = i => (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) / 256;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const fx = Math.min(W - 1.001, b.x + x / K), fy = Math.min(H - 1.001, b.y + y / K), x0 = fx | 0, y0 = fy | 0, ax = fx - x0, ay = fy - y0;
+    const p = (yy, xx) => lum((yy * W + xx) * 4);
+    g[y * w + x] = (p(y0, x0) * (1 - ax) + p(y0, x0 + 1) * ax) * (1 - ay) + (p(y0 + 1, x0) * (1 - ax) + p(y0 + 1, x0 + 1) * ax) * ay;
+  }
+  return { g, w, h };
+}
+// Read the characters on a binarised chip (ink = 0). Returns one score map {char: similarity} per character.
+function readChars(bin, w, h, n) {
+  const lab = new Int32Array(w * h), st = new Int32Array(w * h), comps = [], dots = []; let id = 0;
+  for (let s0 = 0; s0 < w * h; s0++) {
+    if (bin[s0] || lab[s0]) continue;
+    id++; let sp = 0; st[sp++] = s0; lab[s0] = id; let minx = w, maxx = 0, miny = h, maxy = 0, area = 0;
+    while (sp) {
+      const p = st[--sp], x = p % w, y = (p / w) | 0; area++;
+      if (x < minx) minx = x; if (x > maxx) maxx = x; if (y < miny) miny = y; if (y > maxy) maxy = y;
+      if (x > 0 && !bin[p - 1] && !lab[p - 1]) { lab[p - 1] = id; st[sp++] = p - 1; }
+      if (x < w - 1 && !bin[p + 1] && !lab[p + 1]) { lab[p + 1] = id; st[sp++] = p + 1; }
+      if (y > 0 && !bin[p - w] && !lab[p - w]) { lab[p - w] = id; st[sp++] = p - w; }
+      if (y < h - 1 && !bin[p + w] && !lab[p + w]) { lab[p + w] = id; st[sp++] = p + w; }
+    }
+    const bw = maxx - minx + 1, bh = maxy - miny + 1;
+    if (minx === 0 || miny === 0 || maxx === w - 1 || maxy === h - 1) continue;
+    if (bh < 0.1 * h) { if (area >= 3) dots.push({ cx: (minx + maxx) / 2, miny, maxy, bh, bw }); continue; }
+    if (bh > 0.7 * h || area < 10 || bw > 6 * bh) continue;
+    comps.push({ id, minx, maxx, miny, maxy, bw, bh, cy: (miny + maxy) / 2 });
+  }
+  if (!comps.length) return [[]];
+  let line = [];                                  // largest set of same-height parts on one line
+  for (const c of comps) {
+    const grp = comps.filter(o => Math.abs(o.bh - c.bh) <= 0.2 * c.bh && Math.abs(o.cy - c.cy) <= 0.25 * c.bh);
+    if (grp.length > line.length || (grp.length === line.length && c.bh > line[0].bh)) line = grp;
+  }
+  const colInk = (c, x) => { let k = 0; for (let y = c.miny; y <= c.maxy; y++) if (lab[y * w + x] === c.id) k++; return k; };
+  const scorePart = ([c, xa, xb]) => {
+    let miny = h, maxy = 0;
+    for (let y = c.miny; y <= c.maxy; y++) for (let x = xa; x <= xb; x++) if (lab[y * w + x] === c.id) { if (y < miny) miny = y; if (y > maxy) maxy = y; }
+    if (maxy < miny) return null;
+    const bw = xb - xa + 1, bh = maxy - miny + 1, grid = new Float32Array(G * G), tot = new Float32Array(G * G);
+    for (let y = miny; y <= maxy; y++) for (let x = xa; x <= xb; x++) {
+      const k = Math.min(G - 1, ((y - miny) * G / bh) | 0) * G + Math.min(G - 1, ((x - xa) * G / bw) | 0);
+      tot[k]++; if (lab[y * w + x] === c.id) grid[k]++;
+    }
+    for (let i = 0; i < G * G; i++) grid[i] = tot[i] ? grid[i] / tot[i] : 0;
+    const sc = {};
+    for (const ch in DIGITS) { let m = 0; for (const t of DIGITS[ch]) m = Math.max(m, iou(grid, t)); sc[ch] = m; }
+    if (bw < 0.42 * bh) sc["1"] = Math.max(sc["1"], 0.75);            // a narrow upright stroke is a 1
+    // "?" = a hook with a separate dot directly underneath (the dot is too small to be a character)
+    if (dots.some(d => d.cx >= xa - 0.15 * bw && d.cx <= xb + 0.15 * bw && d.miny > maxy && d.miny - maxy < 0.6 * bh && d.bh < 0.35 * bh)) {
+      sc["?"] = 1; for (const k in sc) if (k !== "?") sc[k] = Math.min(sc[k], 0.3);
+    }
+    return sc;
+  };
+  // Touching characters: split the widest blob at its thinnest column until we reach the expected count
+  // Group into runs of tightly spaced characters (separates the ↓ arrow and stray marks from the chip text)
+  const sorted = line.map(c => [c, c.minx, c.maxx]).sort((p, q) => p[1] - q[1]);
+  const mh = sorted.map(p => p[0].bh).sort((x, y) => x - y)[sorted.length >> 1];
+  const runs = [[sorted[0]]];
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i][1] - sorted[i - 1][2] > 0.6 * mh) runs.push([]);
+    runs[runs.length - 1].push(sorted[i]);
+  }
+  const hyps = [];
+  for (const base of runs) {
+    hyps.push(base);
+    let P = base.slice();
+    while (P.length < n) {         // touching characters: split the widest blob at its thinnest column
+      let wi = -1, wr = 0.75;
+      P.forEach(([c, xa, xb], i) => { const r = (xb - xa + 1) / c.bh; if (r > wr) { wr = r; wi = i; } });
+      if (wi < 0) break;
+      const [c, xa, xb] = P[wi], W0 = xb - xa + 1;
+      let cut = -1, ci = 1e9;
+      for (let x = xa + Math.round(0.3 * W0); x <= xa + Math.round(0.7 * W0); x++) { const k = colInk(c, x); if (k < ci) { ci = k; cut = x; } }
+      P.splice(wi, 1, [c, xa, cut - 1], [c, cut + 1, xb]);
+    }
+    if (P.length !== base.length) hyps.push(P);
+  }
+  return hyps.map(P => P.map(scorePart).filter(Boolean));
+}
+// Decode a chip: best window of n characters read as a permutation of 1..n, or "????" (hidden)
+function decodeChip(chars, n) {
+  let best = null;
+  if (chars.length === n) for (let i = 0; i < 1; i++) {
+    const win = chars;
+    const S = win.map(sc => Array.from({ length: n }, (_, d) => sc[String(d + 1)]));
+    const p = bestPerm(S, Array.from({ length: n }, (_, d) => d));
+    const permMean = p.s / n, qMean = win.reduce((m, sc) => m + sc["?"], 0) / n;
+    const minDigit = Math.min(...p.perm.map((d, k) => S[k][d]));
+    const cand = { op: p.perm.map(d => d + 1).join(""), permMean, qMean, minDigit };
+    if (!best || permMean - qMean > best.permMean - best.qMean) best = cand;
+  }
+  if (!best) return { kind: "none" };
+  if (best.qMean >= best.permMean) return { kind: "hidden" };
+  if (best.permMean >= 0.5 && best.minDigit >= 0.38 && best.permMean - best.qMean >= 0.04) return { kind: "op", op: best.op, conf: best.permMean };
+  return { kind: "none" };
+}
+const CHIP_VARIANTS = [[0.6, 18], [1.0, 25], [0.4, 12], [1.4, 30], [0.8, 35]];
+function chipOp(text, n) {
+  if (isPerm(text, n)) return text;
+  for (let i = 1; i + n <= text.length; i++) if (isPerm(text.slice(i, i + n), n)) return text.slice(i, i + n);   // arrow read as a char
+  return null;
+}
+function readOps(src, r, debug, info) {
+  const n = r.top.length, res = [null, null];
+  const rects = chipRects(r, src.W / src.scale, src.H / src.scale);
+  for (let c = 0; c < 2; c++) {
+    const rw = rects[c], sc = src.scale;
+    const b = { x: Math.round(rw.x * sc), y: Math.round(rw.y * sc), w: Math.round(rw.w * sc), h: Math.round(rw.h * sc), s: rw.s * sc };
+    const K = Math.max(1, Math.min(4, 70 / b.s));
+    const { g, w, h } = bandGrayBilinear(src.rgba, src.W, src.H, b, K);
+    const votes = {};
+    for (const [f, C] of CHIP_VARIANTS) {
+      const hyps = readChars(binarizeText(g, w, h, Math.max(3, Math.round(f * b.s * K)), C), w, h, n);
+      let d = { kind: "none" };
+      for (const chars of hyps) {
+        const x = decodeChip(chars, n);
+        if (x.kind === "hidden" && d.kind === "none") d = x;
+        if (x.kind === "op" && (d.kind !== "op" || x.conf > d.conf)) d = x;
+      }
+      const key = d.kind === "op" ? d.op : d.kind;
+      if (debug) debug.push(c + ":" + key);
+      if (key !== "none") votes[key] = (votes[key] || 0) + 1;
+      if (votes[key] >= 3) break;
+    }
+    const ops = Object.keys(votes).filter(k => k !== "hidden").sort((x, y) => votes[y] - votes[x]);
+    if (ops.length && votes[ops[0]] >= 2 && (ops.length === 1 || votes[ops[0]] > votes[ops[1]] + 1) && votes[ops[0]] >= (votes.hidden || 0)) res[c] = ops[0];
+    else if (votes.hidden && !ops.some(k => votes[k] >= 2)) res[c] = "hidden";
+  }
+  if (info) info.res = res.slice();
+  const [a, b] = res, isOp = k => k && k !== "hidden";
+  if (isOp(a) && b === "hidden") return { first: a };     // one chip clearly an operator, the other clearly ????
+  if (isOp(b) && a === "hidden") return { second: b };
+  return null;      // neither or both chips read as an operator -> don't guess
+}
+function solveTwoStepInv(top, bottom, ops) {   // alternative convention: digit i = where input i goes
+  const applyInv = (op, row) => { const o = []; op.forEach((d, i) => o[d - 1] = row[i]); return o; };
+  const deriveInv = (from, to) => from.map(x => to.indexOf(x) + 1).join("");
+  if (ops.first) return deriveInv(applyInv(ops.first.split("").map(Number), top), bottom);
+  if (ops.second) { const op = ops.second.split("").map(Number); return deriveInv(top, op.map(d => bottom[d - 1])); }
+  return null;
+}
+// order: indices of methods to try (all if omitted). Returns result with .mi = method index.
+function solve(rgba, w, h, manualT, order) {
+  const g = toGray(rgba, w * h);
+  lastStats = { blobs: 0, segs: 0, t: 0, list: [] };
+
+  // Manual threshold mode keeps its original greyscale behaviour.
+  if (manualT != null) {
+    for (const pol of [1, -1]) {
+      const r = solveAt(maskGlobal(g, manualT, pol), w, h, 127);
+      if (r) return Object.assign(r, { method: "manual", mi: -1 });
+    }
+    return null;
+  }
+
+  const tryMask = (mask, method) => {
+    const r = solveAt(mask, w, h, 127);
+    return r ? Object.assign(r, { method, mi: -1 }) : null;
+  };
+
+  // Estimate the actual screen background from the upper tail of each RGB
+  // channel. This compensates for camera exposure: "white" need not be 255.
+  // The maximum channel distance treats red, green, blue, yellow and pastel
+  // fills identically, rather than relying on their greyscale brightness.
+  const percentile = (channel, q) => {
+    const hist = new Uint32Array(256);
+    for (let p = channel; p < rgba.length; p += 4) hist[rgba[p]]++;
+    const target = Math.floor((w * h - 1) * q);
+    let total = 0;
+    for (let v = 0; v < 256; v++) {
+      total += hist[v];
+      if (total > target) return v;
+    }
+    return 255;
+  };
+  const bgR = percentile(0, 0.9);
+  const bgG = percentile(1, 0.9);
+  const bgB = percentile(2, 0.9);
+  const bgDistance = new Uint8Array(g.length);
+  const chroma = new Uint8Array(g.length);
+
+  for (let i = 0, p = 0; i < g.length; i++, p += 4) {
+    const R = rgba[p], Gc = rgba[p + 1], B = rgba[p + 2];
+    bgDistance[i] = Math.max(Math.abs(R - bgR), Math.abs(Gc - bgG), Math.abs(B - bgB));
+    chroma[i] = Math.max(R, Gc, B) - Math.min(R, Gc, B);
+  }
+
+  // Segment anything that differs from the estimated white/light background.
+  // Otsu adapts the cut-off to the actual exposure and colour contrast.
+  const bgThreshold = otsu(bgDistance);
+  const bgThresholds = [...new Set([
+    Math.max(5, bgThreshold),
+    Math.max(5, bgThreshold + 4),
+    Math.max(5, bgThreshold - 3),
+    8, 14, 22, 32, 48
+  ])];
+  for (const threshold of bgThresholds) {
+    const r = tryMask(maskGlobal(bgDistance, threshold, 1), "rgb-background+" + threshold);
+    if (r) return r;
+  }
+
+  // Keep the original bright/dark greyscale methods as a fallback. This
+  // preserves monochrome puzzles and supports dark backgrounds and light mode.
+  const L = methods(w), cache = {};
+  const idx = order || L.map((_, i) => i);
+  for (const i of idx) {
+    const r = runMethod(g, w, h, L[i], cache);
+    if (r) return Object.assign(r, { mi: i });
+  }
+
+  // Saturation provides a final hue-independent fallback for coloured symbols
+  // on backgrounds that are not neutral white.
+  const colourThreshold = Math.max(6, Math.min(otsu(chroma), 32));
+  for (const pol of [1, -1]) {
+    const r = tryMask(maskGlobal(chroma, colourThreshold, pol),
+                      "chroma" + (pol > 0 ? "+" : "−"));
+    if (r) return r;
+  }
+
+  return null;
+}
+</script>
+<script>
+(() => {
+const $=id=>document.getElementById(id), canvas=$("preview"),ctx=canvas.getContext("2d",{willReadFrequently:true});
+const palette=["#df202b","#ffbd18","#78b900","#39b9e8","#9636c5","#16a49a","#ed6125","#3264d2"];
+let seed=1, ready=typeof solve==="function"&&typeof classList==="function";
+$("status").textContent=ready?"Production solver loaded. Ready to run.":"Could not load the production solver.";
+const rand=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296};
+function shuffle(a){a=a.slice();for(let i=a.length-1;i>0;i--){let j=Math.floor(rand()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
+function polygon(points){ctx.beginPath();ctx.moveTo(points[0][0],points[0][1]);for(let i=1;i<points.length;i++)ctx.lineTo(points[i][0],points[i][1]);ctx.closePath();ctx.fill()}
+function drawShape(kind,x,y,size,color){
+ ctx.save();ctx.translate(x,y);ctx.fillStyle=color;const h=size/2;
+ if(kind==="square"){ctx.fillRect(-h,-h,size,size)}
+ else if(kind==="circle"){ctx.beginPath();ctx.arc(0,0,h,0,Math.PI*2);ctx.fill()}
+ else if(kind==="triangle"){polygon([[0,-h],[h,h],[-h,h]])}
+ else if(kind==="diamond"){polygon([[0,-h],[h,0],[0,h],[-h,0]])}
+ else if(kind==="hexagon"){polygon([[-h*.5,-h],[h*.5,-h],[h,h*.0],[h*.5,h],[-h*.5,h],[-h,0]])}
+ else if(kind==="plus"){ctx.fillRect(-size*.17,-h,size*.34,size);ctx.fillRect(-h,-size*.17,size,size*.34)}
+ else if(kind==="star"){const pts=[];for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5,r=i%2?h:h*.42;pts.push([Math.cos(a)*r,Math.sin(a)*r])}polygon(pts)}
+ ctx.restore()
+}
+function drawTile(x,y,size,kind,color){
+ ctx.save();ctx.shadowColor="rgba(0,0,0,.16)";ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle="#d2d4d5";ctx.beginPath();ctx.roundRect(x-size*.72,y-size*.72,size*1.44,size*1.44,14);ctx.fill();ctx.restore();
+ drawShape(kind,x,y,size*.78,color)
+}
+function makeScenario(){
+ const kinds=classList(),n=3+Math.floor(rand()*5),top=shuffle(kinds).slice(0,n),bottom=shuffle(top),pitch=Math.min(145,Math.floor(820/(n+1))),size=40+Math.floor(rand()*18),gap=2.5+rand()*0.8;
+ const xs=Array.from({length:n},(_,i)=>(900-(n-1)*pitch)/2+i*pitch),y1=105,y2=Math.round(y1+gap*pitch);
+ ctx.clearRect(0,0,900,600);ctx.fillStyle="#fff";ctx.fillRect(0,0,900,600);
+ top.forEach((k,i)=>drawTile(xs[i],y1,size,k,palette[Math.floor(rand()*palette.length)]));
+ bottom.forEach((k,i)=>drawTile(xs[i],y2,size,k,palette[Math.floor(rand()*palette.length)]));
+ const expected=bottom.map(k=>top.indexOf(k)+1).join("");
+ return {expected,top,bottom,n};
+}
+function showMetric(prefix,pass,total,elapsed){const rate=total?pass/total*100:0;$(prefix+"Pass").textContent=pass+"/"+total;$(prefix+"Rate").textContent=rate.toFixed(1)+"%";$(prefix+"Fill").style.width=rate+"%";if(prefix==="image")$(prefix+"Time").textContent=(elapsed/Math.max(1,total)).toFixed(1)+" ms";else $(prefix+"Time").textContent=(elapsed/Math.max(1,total)).toFixed(3)+" ms"}
+$("run").addEventListener("click",()=>{
+ if(!ready)return;const total=Number($("count").value);$("run").disabled=true;$("status").textContent="Running image simulations…";let pass=0,elapsed=0,failures=[];
+ for(let i=0;i<total;i++){
+  const t=makeScenario(),pixels=ctx.getImageData(0,0,900,600).data,start=performance.now(),r=solve(pixels,900,600,null),dt=performance.now()-start;elapsed+=dt;
+  const ok=!!r&&r.code===t.expected&&r.top.join("|")===t.top.join("|")&&r.bottom.join("|")===t.bottom.join("|");
+  if(ok)pass++;else if(failures.length<40)failures.push("#"+(i+1)+" n="+t.n+" expected="+t.expected+" actual="+(r?.code||"no result")+" method="+(r?.method||"none"));
+ }
+ showMetric("image",pass,total,elapsed);$("failures").textContent=failures.length?failures.join("\n"):"No failures in this run."; $("status").textContent="Completed "+total+" generated image scenarios."; $("run").disabled=false;
+});
+$("math").addEventListener("click",()=>{
+ if(!ready)return;let pass=0,elapsed=0,failures=[];
+ const perm=n=>{const a=Array.from({length:n},(_,i)=>i+1);for(let i=n-1;i>0;i--){let j=Math.floor(rand()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a},apply=(op,row)=>op.map(d=>row[d-1]);
+ for(let i=0;i<500;i++){const n=3+Math.floor(rand()*5),top=perm(n),op1=perm(n),op2=perm(n),mid=apply(op1,top),bottom=apply(op2,mid),first=i%2===0,ops=first?{first:op1.join("")}:{second:op2.join("")},expected=first?op2.join(""):op1.join(""),start=performance.now(),got=solveTwoStep(top,bottom,ops);elapsed+=performance.now()-start;if(got?.code===expected)pass++;else if(failures.length<40)failures.push("logic #"+(i+1)+" expected="+expected+" actual="+(got?.code||"null"));}
+ showMetric("math",pass,500,elapsed);$("failures").textContent=failures.length?failures.join("\n"):"No failures in logic run."; $("status").textContent="Completed 500 permutation logic scenarios.";
+});
+})();
+</script>
+</body>
+</html>
