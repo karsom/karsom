@@ -22,7 +22,7 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;bord
 <body>
 <main>
 <h1>Switch solver simulation benchmark</h1>
-<p>Runs the production shape solver against generated three-row puzzle layouts. No camera, network service or uploaded screenshots are used. The benchmark loads the solver directly from <code>./index.html</code>.</p>
+<p>Runs the production shape solver against generated three-row puzzle layouts. No camera, network service or uploaded screenshots are used. The benchmark embeds the production solver core as it existed when this page was published. If the solver changes, refresh the embedded core before comparing new results.</p>
 <section class="panel">
 <div class="controls">
 <label>Image scenarios <select id="count"><option>50</option><option selected>100</option><option>200</option></select></label>
@@ -668,7 +668,7 @@ function drawTile(x,y,size,kind,color){
 }
 function makeScenario(){
  const kinds=classList(),n=3+Math.floor(rand()*5),top=shuffle(kinds).slice(0,n),bottom=shuffle(top),pitch=Math.min(145,Math.floor(820/(n+1))),size=40+Math.floor(rand()*18),gap=2.5+rand()*0.8;
- const xs=Array.from({length:n},(_,i)=>(900-(n-1)*pitch)/2+i*pitch),y1=105,y2=Math.round(y1+gap*pitch);
+ const xs=Array.from({length:n},(_,i)=>(900-(n-1)*pitch)/2+i*pitch),y1=105,y2=Math.round(y1+(2.35+rand()*0.45)*pitch);
  ctx.clearRect(0,0,900,600);ctx.fillStyle="#fff";ctx.fillRect(0,0,900,600);
  top.forEach((k,i)=>drawTile(xs[i],y1,size,k,palette[Math.floor(rand()*palette.length)]));
  bottom.forEach((k,i)=>drawTile(xs[i],y2,size,k,palette[Math.floor(rand()*palette.length)]));
