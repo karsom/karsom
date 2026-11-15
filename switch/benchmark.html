@@ -10,6 +10,8 @@
 main{max-width:980px;margin:auto}h1{font-size:25px;margin:0 0 8px}p{color:var(--muted);margin:0 0 18px}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:18px;margin:16px 0}
 .controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap}button{border:0;border-radius:10px;background:var(--accent);color:#101827;font-weight:700;padding:11px 16px;cursor:pointer}button:disabled{opacity:.55;cursor:wait}
+.fileBtn{display:inline-flex;align-items:center;border-radius:10px;background:#26364f;color:var(--text);font-weight:700;padding:11px 16px;cursor:pointer}
+.fileBtn input{display:none}
 select{background:#111722;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px}
 .metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.metric{background:#111722;border:1px solid var(--line);border-radius:12px;padding:13px}.metric strong{display:block;font-size:27px}.metric span{color:var(--muted);font-size:12px}
 .track{height:10px;background:#30394b;border-radius:9px;overflow:hidden;margin-top:12px}.fill{height:100%;width:0;background:var(--good);transition:width .2s}
@@ -28,9 +30,12 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;bord
 <label>Image scenarios <select id="count"><option>50</option><option selected>100</option><option>200</option></select></label>
 <button id="run">Run simulations</button>
 <button id="math">Run 500 permutation tests</button>
+<button id="example">Test 1324 example</button>
+<label class="fileBtn">Test a photo <input id="photo" type="file" accept="image/*"></label>
 </div>
 <div id="status">Loading production solver…</div>
 <canvas id="preview" width="900" height="600"></canvas>
+<div id="exampleResult" class="note">The fixed example and a real photo can be tested here. Results include both recognised rows and the derived permutation.</div>
 </section>
 <section class="panel">
 <h2>Image recognition results</h2>
@@ -686,6 +691,7 @@ function makeScenario(fixed=false){
  const pitch=Math.min(145,Math.floor(820/(n+1))),size=fixed?48:38+Math.floor(rand()*16);
  const centre=450, y1=112, y2=fixed?485:Math.round(y1+(2.35+rand()*0.45)*pitch);
  const drift=(rand()-.5)*34, squeeze=0.94+rand()*0.12;
+ if(canvas.width!==900||canvas.height!==600){canvas.width=900;canvas.height=600;}
  ctx.clearRect(0,0,900,600);
  const bg=ctx.createLinearGradient(0,0,0,600);bg.addColorStop(0,"#fff");bg.addColorStop(1,"#e8e8e8");
  ctx.fillStyle=bg;ctx.fillRect(0,0,900,600);
@@ -710,6 +716,32 @@ function makeScenario(fixed=false){
  const expected=bottom.map(k=>top.indexOf(k)+1).join("");
  return {expected,top,bottom,n};
 }
+$("example").addEventListener("click",()=>{
+ const t=makeScenario(true),pixels=ctx.getImageData(0,0,900,600).data,start=performance.now(),r=solve(pixels,900,600,null),elapsed=performance.now()-start;
+ const ok=!!r&&r.code===t.expected&&r.top.join("|")===t.top.join("|")&&r.bottom.join("|")===t.bottom.join("|");
+ $("exampleResult").textContent=ok
+  ? "PASS · Top: "+r.top.map(glyph).join(" ")+" · Bottom: "+r.bottom.map(glyph).join(" ")+" · Code: "+r.code+" · "+r.method+" · "+elapsed.toFixed(1)+" ms"
+  : "FAIL · Expected 1324 · Actual: "+(r?.code||"no confident result")+" · "+(r?.method||"no method");
+ $("status").textContent=ok?"Fixed 1324 example passed.":"Fixed 1324 example did not pass.";
+});
+$("photo").addEventListener("change",e=>{
+ const file=e.target.files&&e.target.files[0];if(!file)return;
+ const url=URL.createObjectURL(file),img=new Image();
+ $("photoResult") && ($("photoResult").textContent="Reading photo…");
+ img.onload=()=>{
+  const scale=Math.min(1,900/img.naturalWidth),w=Math.max(1,Math.round(img.naturalWidth*scale)),h=Math.max(1,Math.round(img.naturalHeight*scale));
+  canvas.width=w;canvas.height=h;ctx.drawImage(img,0,0,w,h);
+  const px=ctx.getImageData(0,0,w,h).data,start=performance.now(),r=solve(px,w,h,null),elapsed=performance.now()-start;
+  const detail=r
+   ? "Photo result · Top: "+r.top.map(glyph).join(" ")+" · Bottom: "+r.bottom.map(glyph).join(" ")+" · Net code: "+r.code+" · confidence "+(r.conf??0).toFixed(3)+" · margin "+(r.margin??0).toFixed(3)+" · "+r.method+" · "+elapsed.toFixed(1)+" ms"
+   : "No confident two-row solution detected. Try a sharper, less obstructed photo with both symbol rows visible.";
+  $("exampleResult").textContent=detail;
+  $("status").textContent=r?"Photo processed. Check the recognised rows and net code above.":"Photo processed without a confident result.";
+  URL.revokeObjectURL(url);
+ };
+ img.onerror=()=>{ $("exampleResult").textContent="Could not load that image file."; $("status").textContent="Photo loading failed."; URL.revokeObjectURL(url); };
+ img.src=url;
+});
 function showMetric(prefix,pass,total,elapsed){const rate=total?pass/total*100:0;$(prefix+"Pass").textContent=pass+"/"+total;$(prefix+"Rate").textContent=rate.toFixed(1)+"%";$(prefix+"Fill").style.width=rate+"%";if(prefix==="image")$(prefix+"Time").textContent=(elapsed/Math.max(1,total)).toFixed(1)+" ms";else $(prefix+"Time").textContent=(elapsed/Math.max(1,total)).toFixed(3)+" ms"}
 $("run").addEventListener("click",()=>{
  if(!ready)return;const total=Number($("count").value);$("run").disabled=true;$("status").textContent="Running image simulations…";let pass=0,elapsed=0,failures=[];
