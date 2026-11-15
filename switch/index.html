@@ -88,7 +88,7 @@
   </div>
 
   <div class="tips">
-    <b>Works on:</b> single-operator levels and two-operator levels (hidden middle row — it reads the operator chip).<br><b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
+    <b>Works on:</b> coloured symbols on white or neutral grey tiles, single-operator levels and two-operator levels. It separates saturated symbol fills from grey tiles and machinery. When no operator chip can be read, it shows the net top-to-bottom permutation and labels it as a direct result.<br><b>Live:</b> tap Start once, keep both symbol rows in view — the code updates by itself every level. Add to Home Screen for one-tap launch.<br>
     <b>Frame it:</b> hold the phone 25–30 cm from the screen (closer and the camera can't focus), both symbol rows in shot, phone roughly parallel to the screen, no glare across the symbols.<br>
     <b>Wrong read?</b> Freeze → tap the wrong symbol → pick the right one. It learns on this phone and gets better each time. Unknown symbols (♥ etc.) can be taught with ＋ new shape.<br><b>Green boxes</b> = symbols read. If it fails, try again with less glare, or drag Threshold off "auto".
   </div>
@@ -644,6 +644,18 @@ function solve(rgba, w, h, manualT, order) {
     chroma[i] = Math.max(R, Gc, B) - Math.min(R, Gc, B);
   }
 
+  // Prioritise chroma when the puzzle contains saturated symbols on neutral
+  // grey tiles or grey machinery. This isolates red, green, blue and yellow
+  // symbols without treating the tile itself as part of the shape.
+  const chromaOtsu = otsu(chroma);
+  if (chromaOtsu >= 28) {
+    const chromaThresholds = [...new Set([32, Math.min(chromaOtsu, 48), 24, 40])];
+    for (const threshold of chromaThresholds) {
+      const r = tryMask(maskGlobal(chroma, threshold, 1), "chroma-first+" + threshold);
+      if (r) return r;
+    }
+  }
+
   // Segment anything that differs from the estimated white/light background.
   // Otsu adapts the cut-off to the actual exposure and colour contrast.
   const bgThreshold = otsu(bgDistance);
@@ -706,7 +718,13 @@ function finalize(r, src, sw, sh) {
     if (!ops) pendingTwo = { r, key, guessChip: info.res && info.res[0] === "hidden" ? "second" : "first" };
     if (ops) { const a = solveTwoStep(r.top, r.bottom, ops); hit = { ops, code: a.code, inverse: solveTwoStepInv(r.top, r.bottom, ops) }; twoCache.set(key, hit); }
   }
-  if (!hit) return Object.assign(r, { kind: "two", code: null, pending: true });
+  if (!hit) {
+    // No operator chip was confidently detected. Still expose the net
+    // top-to-bottom permutation instead of leaving a valid puzzle unanswered.
+    // The UI labels this as a direct result, not as a recovered hidden operator.
+    pendingTwo = null;
+    return Object.assign(r, { kind: "direct", code: r.code, inverse: r.inverse, pending: false });
+  }
   return Object.assign(r, { kind: "two", ops: hit.ops, code: hit.code, inverse: hit.inverse });
 }
 const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
@@ -731,7 +749,9 @@ function show(r) {
     $("inv").textContent = "Hidden " + (o.first ? "2nd" : "1st") + " operator · not an option? Try " + r.inverse;
   } else {
     $("rows").textContent = r.top.map(glyph).join(" ") + "  →  " + r.bottom.map(glyph).join(" ");
-    $("inv").textContent = "Not an option? Try " + r.inverse;
+    $("inv").textContent = r.kind === "direct"
+      ? "Direct top-to-bottom permutation · inverse " + r.inverse
+      : "Not an option? Try " + r.inverse;
   }
 }
 
