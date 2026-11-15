@@ -749,8 +749,9 @@ function show(r) {
     $("inv").textContent = "Hidden " + (o.first ? "2nd" : "1st") + " operator · not an option? Try " + r.inverse;
   } else {
     $("rows").textContent = r.top.map(glyph).join(" ") + "  →  " + r.bottom.map(glyph).join(" ");
+    const mapping = r.code.split("").map((d, i) => (i + 1) + "→" + d).join(" · ");
     $("inv").textContent = r.kind === "direct"
-      ? "Direct top-to-bottom permutation · inverse " + r.inverse
+      ? "Direct mapping: " + mapping + " · inverse " + r.inverse
       : "Not an option? Try " + r.inverse;
   }
 }
