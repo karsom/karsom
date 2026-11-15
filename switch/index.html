@@ -637,18 +637,22 @@ function solve(rgba, w, h, manualT, order) {
   const bgB = percentile(2, 0.9);
   const bgDistance = new Uint8Array(g.length);
   const chroma = new Uint8Array(g.length);
+  let saturatedPixels = 0;
 
   for (let i = 0, p = 0; i < g.length; i++, p += 4) {
     const R = rgba[p], Gc = rgba[p + 1], B = rgba[p + 2];
     bgDistance[i] = Math.max(Math.abs(R - bgR), Math.abs(Gc - bgG), Math.abs(B - bgB));
     chroma[i] = Math.max(R, Gc, B) - Math.min(R, Gc, B);
+    if (chroma[i] >= 48) saturatedPixels++;
   }
 
   // Prioritise chroma when the puzzle contains saturated symbols on neutral
-  // grey tiles or grey machinery. This isolates red, green, blue and yellow
-  // symbols without treating the tile itself as part of the shape.
+  // grey tiles or grey machinery. The pixel-count check also catches small
+  // coloured symbols whose contribution to the whole-frame Otsu histogram
+  // is too small to move its threshold. This isolates red, green, blue and
+  // yellow symbols without treating the tile itself as part of the shape.
   const chromaOtsu = otsu(chroma);
-  if (chromaOtsu >= 28) {
+  if (chromaOtsu >= 28 || saturatedPixels > g.length * 0.005) {
     const chromaThresholds = [...new Set([32, Math.min(chromaOtsu, 48), 24, 40])];
     for (const threshold of chromaThresholds) {
       const r = tryMask(maskGlobal(chroma, threshold, 1), "chroma-first+" + threshold);
