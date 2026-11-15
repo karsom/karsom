@@ -22,7 +22,7 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;bord
 <body>
 <main>
 <h1>Switch solver simulation benchmark</h1>
-<p>Runs the production shape solver against generated three-row puzzle layouts. No camera, network service or uploaded screenshots are used. The benchmark embeds the production solver core as it existed when this page was published. If the solver changes, refresh the embedded core before comparing new results.</p>
+<p>Runs the production shape solver against generated phone-style puzzles. Scenarios use coloured symbols on neutral grey tiles, grey mechanical clutter, mild perspective and light image noise. A fixed four-symbol case matches the uploaded example and should return 1324. No camera or network service is used.</p>
 <section class="panel">
 <div class="controls">
 <label>Image scenarios <select id="count"><option>50</option><option selected>100</option><option>200</option></select></label>
@@ -40,7 +40,7 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px;bord
 <div class="metric"><strong id="imageTime">—</strong><span>Average solve time</span></div>
 </div>
 <div class="track"><div class="fill" id="imageFill"></div></div>
-<p class="note">Each generated image contains a top and bottom row of coloured shapes on light grey tiles, with the hidden middle row represented by the two-step permutation calculation. Shape count varies from three to seven.</p>
+<p class="note">The image suite includes the fixed example (triangle, plus, circle, square → triangle, circle, plus, square = 1324) plus random three to seven shape permutations. Grey pipes, panels and digits are distractors; they should not be mistaken for symbols. Shape colours are randomised between runs.</p>
 </section>
 <section class="panel">
 <h2>Two-operator logic results</h2>
@@ -607,6 +607,18 @@ function solve(rgba, w, h, manualT, order) {
     chroma[i] = Math.max(R, Gc, B) - Math.min(R, Gc, B);
   }
 
+  // Prioritise chroma when the puzzle contains saturated symbols on neutral
+  // grey tiles or grey machinery. This isolates red, green, blue and yellow
+  // symbols without treating the tile itself as part of the shape.
+  const chromaOtsu = otsu(chroma);
+  if (chromaOtsu >= 28) {
+    const chromaThresholds = [...new Set([32, Math.min(chromaOtsu, 48), 24, 40])];
+    for (const threshold of chromaThresholds) {
+      const r = tryMask(maskGlobal(chroma, threshold, 1), "chroma-first+" + threshold);
+      if (r) return r;
+    }
+  }
+
   // Segment anything that differs from the estimated white/light background.
   // Otsu adapts the cut-off to the actual exposure and colour contrast.
   const bgThreshold = otsu(bgDistance);
@@ -666,12 +678,35 @@ function drawTile(x,y,size,kind,color){
  ctx.save();ctx.shadowColor="rgba(0,0,0,.16)";ctx.shadowBlur=8;ctx.shadowOffsetY=3;ctx.fillStyle="#d2d4d5";ctx.beginPath();ctx.roundRect(x-size*.72,y-size*.72,size*1.44,size*1.44,14);ctx.fill();ctx.restore();
  drawShape(kind,x,y,size*.78,color)
 }
-function makeScenario(){
- const kinds=classList(),n=3+Math.floor(rand()*5),top=shuffle(kinds).slice(0,n),bottom=shuffle(top),pitch=Math.min(145,Math.floor(820/(n+1))),size=40+Math.floor(rand()*18),gap=2.5+rand()*0.8;
- const xs=Array.from({length:n},(_,i)=>(900-(n-1)*pitch)/2+i*pitch),y1=105,y2=Math.round(y1+(2.35+rand()*0.45)*pitch);
- ctx.clearRect(0,0,900,600);ctx.fillStyle="#fff";ctx.fillRect(0,0,900,600);
- top.forEach((k,i)=>drawTile(xs[i],y1,size,k,palette[Math.floor(rand()*palette.length)]));
- bottom.forEach((k,i)=>drawTile(xs[i],y2,size,k,palette[Math.floor(rand()*palette.length)]));
+function makeScenario(fixed=false){
+ const kinds=classList();
+ const n=fixed?4:3+Math.floor(rand()*5);
+ const top=fixed?["triangle","plus","circle","square"]:shuffle(kinds).slice(0,n);
+ const bottom=fixed?["triangle","circle","plus","square"]:shuffle(top);
+ const pitch=Math.min(145,Math.floor(820/(n+1))),size=fixed?48:38+Math.floor(rand()*16);
+ const centre=450, y1=112, y2=fixed?485:Math.round(y1+(2.35+rand()*0.45)*pitch);
+ const drift=(rand()-.5)*34, squeeze=0.94+rand()*0.12;
+ ctx.clearRect(0,0,900,600);
+ const bg=ctx.createLinearGradient(0,0,0,600);bg.addColorStop(0,"#fff");bg.addColorStop(1,"#e8e8e8");
+ ctx.fillStyle=bg;ctx.fillRect(0,0,900,600);
+
+ // Grey connecting rails, panels and a central code mimic the non-symbol
+ // apparatus in the photographed puzzle. Chroma segmentation must ignore it.
+ ctx.save();ctx.strokeStyle="rgba(155,160,163,.68)";ctx.lineWidth=15;ctx.lineCap="round";
+ ctx.beginPath();ctx.moveTo(100,285);ctx.lineTo(800,285);ctx.moveTo(100,315);ctx.lineTo(800,315);ctx.stroke();
+ ctx.fillStyle="#bfc1c2";ctx.fillRect(345,250,210,95);
+ ctx.fillStyle="#777b7e";ctx.font="36px Arial";ctx.textAlign="center";ctx.fillText(fixed?"1324":"1234",450,310);
+ ctx.restore();
+
+ const xsTop=Array.from({length:n},(_,i)=>centre-((n-1)*pitch)/2+i*pitch);
+ const xsBottom=Array.from({length:n},(_,i)=>centre+drift-((n-1)*pitch*squeeze)/2+i*pitch*squeeze);
+ top.forEach((k,i)=>drawTile(xsTop[i]+(rand()-.5)*3,y1+(i-(n-1)/2)*1.6,size,k,palette[Math.floor(rand()*palette.length)]));
+ bottom.forEach((k,i)=>drawTile(xsBottom[i]+(rand()-.5)*3,y2+(i-(n-1)/2)*1.6,size*.94,k,palette[Math.floor(rand()*palette.length)]));
+
+ // Mild luminance noise simulates a phone photo without changing hue.
+ const frame=ctx.getImageData(0,0,900,600);
+ for(let p=0;p<frame.data.length;p+=4){const v=(rand()-.5)*5;for(let c=0;c<3;c++)frame.data[p+c]=Math.max(0,Math.min(255,frame.data[p+c]+v));}
+ ctx.putImageData(frame,0,0);
  const expected=bottom.map(k=>top.indexOf(k)+1).join("");
  return {expected,top,bottom,n};
 }
@@ -679,7 +714,7 @@ function showMetric(prefix,pass,total,elapsed){const rate=total?pass/total*100:0
 $("run").addEventListener("click",()=>{
  if(!ready)return;const total=Number($("count").value);$("run").disabled=true;$("status").textContent="Running image simulations…";let pass=0,elapsed=0,failures=[];
  for(let i=0;i<total;i++){
-  const t=makeScenario(),pixels=ctx.getImageData(0,0,900,600).data,start=performance.now(),r=solve(pixels,900,600,null),dt=performance.now()-start;elapsed+=dt;
+  const t=makeScenario(i===0),pixels=ctx.getImageData(0,0,900,600).data,start=performance.now(),r=solve(pixels,900,600,null),dt=performance.now()-start;elapsed+=dt;
   const ok=!!r&&r.code===t.expected&&r.top.join("|")===t.top.join("|")&&r.bottom.join("|")===t.bottom.join("|");
   if(ok)pass++;else if(failures.length<40)failures.push("#"+(i+1)+" n="+t.n+" expected="+t.expected+" actual="+(r?.code||"no result")+" method="+(r?.method||"none"));
  }
